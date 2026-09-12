@@ -19,33 +19,30 @@ then hands the engine a stream.
 
 ## Build it and run one engine
 
-No engine ships a binary; the tests are the runnable examples. Clone, build, and run the suite:
+No engine ships a binary; each ships a runnable example (`crates/measure/examples/reach.rs`). Clone,
+then run it: two in-process nodes over the mem transport, a ping and a speed test, with no sockets
+involved.
 
 ```sh
 git clone https://github.com/theia-hq/services
 cd services
-cargo test --locked
 ```
 
-The `measure` integration test is the end-to-end example: two in-process nodes, a `ping`, and a `speed`
-test with no sockets involved. Run it alone:
-
-<!-- capture: cargo test --locked -p measure --test reach -->
+<!-- capture: cargo run --example reach -->
 ```sh
-cargo test --locked -p measure --test reach
+cargo run --example reach
 ```
 
 ```
-running 7 tests
-test a_speed_frame_on_a_ping_only_node_carries_the_unsupported_refusal ... ok
-test a_ping_frame_on_a_speed_only_node_carries_the_unsupported_refusal ... ok
-test bidir_moves_bytes_in_both_directions_at_once ... ok
-test ping_measures_round_trips_with_no_loss ... ok
-test observing_reports_every_probe_in_order_as_it_lands ... ok
-test speed_moves_bytes_in_each_direction ... ok
-test time_bounded_speed_respects_the_duration_not_a_byte_count ... ok
+ping: 3 sent, 3 received, 0% loss, rtt min 50.125µs avg 94.736µs max 139.292µs mdev 29.741µs
+speed up: 4.00 MiB in 1.8 ms at 2233.4 MiB/s
+speed down: 4.00 MiB in 1.8 ms at 2233.4 MiB/s
+```
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+The tests cover each engine end to end, refusal paths included:
+
+```sh
+cargo test --locked
 ```
 
 ## Embed an engine
