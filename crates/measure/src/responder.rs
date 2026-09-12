@@ -50,6 +50,18 @@ impl Responder {
 /// (the client sends its whole run over one stream). A non-ping frame is a wire-level violation, not a
 /// silent widening: the outer `ping` gate admitted this stream for liveness only, so a speed frame
 /// here is refused with [`ProtocolError::WrongService`].
+///
+/// The caller owns admission. Once a session is admitted, this is the whole server side:
+///
+/// ```
+/// use measure::answer_ping;
+///
+/// async fn serve<S: bifrost::Session>(session: S) {
+///     while let Ok((writer, reader)) = session.accept_bi().await {
+///         let _ = answer_ping(writer, reader).await;
+///     }
+/// }
+/// ```
 pub async fn answer_ping<W, R>(mut writer: W, mut reader: R) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,

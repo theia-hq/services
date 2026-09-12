@@ -41,7 +41,7 @@ stays out of programs that do not serve a shell.
   ids.
 - **Dropping the `serve` future does not abort a live shell.** The SSH session runs on a detached task, so
   the shell runs until the client disconnects or exits. The live-shell cap bounds how many run at once.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The API changes
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
   without notice.
 
 ## License

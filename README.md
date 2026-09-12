@@ -20,9 +20,8 @@ you want.
 
 ## Build it and run one engine
 
-The engines are libraries. `measure` carries a runnable example (`crates/measure/examples/reach.rs`):
-clone, then run it. Two in-process nodes over the mem transport, a ping and a speed test, with no sockets
-involved.
+`measure` carries a runnable example (`crates/measure/examples/reach.rs`): clone, then run it. Two
+in-process nodes over the mem transport, a ping and a speed test, with no sockets involved.
 
 ```sh
 git clone https://github.com/theia-hq/services
@@ -48,29 +47,37 @@ cargo test --locked
 
 ## Embed an engine
 
-Add the crate you need as a git dependency:
+Add the crates you need as git dependencies:
 
 ```toml
 [dependencies]
-fetch = { git = "https://github.com/theia-hq/services" }
+bifrost = { git = "https://github.com/theia-hq/bifrost" }
+measure = { git = "https://github.com/theia-hq/services" }
 ```
 
-Each engine README names its entry point and the policy the caller keeps. Git is the only source today, so
+The server side of an engine is a plain function over the stream halves. This is all `measure` needs to
+serve `ping` on a session:
+
+```rust
+use measure::answer_ping;
+
+async fn serve<S: bifrost::Session>(session: S) {
+    while let Ok((writer, reader)) = session.accept_bi().await {
+        let _ = answer_ping(writer, reader).await;
+    }
+}
+```
+
+Each engine README names its entry points and the policy the caller keeps. Git is the only source today, so
 pinning a rev is available if you want a fixed point; that choice is the embedder's.
 
 ## Honest limits
 
 - **The engines are the work, not the policy.** Admission, exposure, and public-use decisions stay in the
-  embedding program. This repo ships no gate, no registry, and no binary.
+  embedding program. This repo ships no gate, no registry, and no binary. Each engine README carries that
+  engine's limits.
 - **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The APIs change
   without notice.
-- **The shell is remote code execution by construction.** `sshh` refuses to run as root, caps live shells
-  at 64 per process, and serves only a stream the caller proves was admitted. Who reaches it, and with
-  what capability, is the embedder's policy.
-- **`measure` and `transfer` set no byte caps, and `fetch` caps no response body.** An admitted peer can
-  move bytes without a bound the engine sets; the embedder's stream and session caps are the only bound.
-- **An empty `OriginAllowlist` is unconstrained.** The SSRF guard still holds, so only public origins
-  pass, but any public origin does.
 - **One repo, one rev.** All four engines share a rev; a bump for one moves the pin for the others. A
   consumer depends on only the crate it needs.
 
