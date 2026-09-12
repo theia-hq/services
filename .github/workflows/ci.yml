@@ -1,0 +1,34 @@
+# Build, test, and lint every PR and push to main in the PATCH-FREE (shipping-form) environment, so a
+# stale sibling rev pin or a lock that does not resolve fails HERE, not in a consumer's build. --locked is
+# correct on PR: lock-guard.sh keeps the committed lock in shipping-form, so --locked in the patch-free
+# checkout proves it resolves from the pinned git sources.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: lock guard
+        run: sh scripts/lock-guard.sh .
+      - name: build
+        run: cargo build --locked
+      - name: test
+        run: cargo test --locked
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: fmt check
+        run: cargo +nightly fmt --check
