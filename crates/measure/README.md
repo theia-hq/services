@@ -24,6 +24,9 @@ The server side is a plain async function over the stream halves: `answer_ping`,
 or `Responder::serve` on an accepted session. The caller owns admission and decides which methods a node
 serves.
 
+A runnable example lives at [`examples/reach.rs`](examples/reach.rs): two in-process nodes over the mem
+transport, one ping, and one speed test, with no sockets involved.
+
 ## Honest limits
 
 - **No byte cap.** A time-bounded `speed` source streams until the client stops reading, and a sink drains
@@ -36,7 +39,7 @@ serves.
   a second run needs a new value.
 - **A probe failure counts as loss, except a refusal.** A refused method short-circuits the run with a
   typed error rather than folding into the loss figure.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The API changes
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
   without notice.
 
 ## License

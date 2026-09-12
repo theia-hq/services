@@ -8,13 +8,13 @@ then hands the engine a stream.
 
 ## The engines
 
-- **fetch**: perform an HTTP `GET`/`HEAD` at an origin for an admitted requester, with the target vetted
+- **[fetch](crates/fetch/README.md)**: perform an HTTP `GET`/`HEAD` at an origin for an admitted requester, with the target vetted
   against SSRF and the operator's `OriginAllowlist`.
-- **measure**: answer `ping` (round-trip time) and `speed` (throughput) tests on a session, or run the
+- **[measure](crates/measure/README.md)**: answer `ping` (round-trip time) and `speed` (throughput) tests on a session, or run the
   same tests from the client side.
-- **sshh**: serve a shell over an admitted stream to a standard `ssh` client, with no SSH keys; the
+- **[sshh](crates/sshh/README.md)**: serve a shell over an admitted stream to a standard `ssh` client, with no SSH keys; the
   stream's admission is the only credential.
-- **transfer**: receive one pushed file off an admitted stream, verified end to end with BLAKE3 and saved
+- **[transfer](crates/transfer/README.md)**: receive one pushed file off an admitted stream, verified end to end with BLAKE3 and saved
   under an output directory.
 
 ## Build it and run one engine
@@ -28,7 +28,7 @@ git clone https://github.com/theia-hq/services
 cd services
 ```
 
-<!-- capture: cargo run --example reach -->
+<!-- live-run: cargo run --example reach; the timing numbers vary run to run -->
 ```sh
 cargo run --example reach
 ```
@@ -47,20 +47,21 @@ cargo test --locked
 
 ## Embed an engine
 
-Add the crate you need as a git dependency, pinned to an exact commit:
+Add the crate you need as a git dependency:
 
 ```toml
 [dependencies]
-fetch = { git = "https://github.com/theia-hq/services", rev = "<40-char commit>" }
+fetch = { git = "https://github.com/theia-hq/services" }
 ```
 
-Each engine README names its entry point and the policy the caller keeps.
+Each engine README names its entry point and the policy the caller keeps. Git is the only source today, so
+pinning a rev is available if you want a fixed point; that choice is the embedder's.
 
 ## Honest limits
 
 - **The engines are the work, not the policy.** Admission, exposure, and public-use decisions stay in the
   embedding program. This repo ships no gate, no registry, and no binary.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The APIs change
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The APIs change
   without notice.
 - **The shell is remote code execution by construction.** `sshh` refuses to run as root, caps live shells
   at 64 per process, and serves only a stream the caller proves was admitted. Who reaches it, and with
