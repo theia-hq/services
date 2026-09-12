@@ -1,34 +1,50 @@
 # fetch
 
-An HTTP origin fetch a keyed node performs on a requester's behalf. The node acts as an HTTP client on a
-requester's behalf: it reads a request off an already-authorized stream, performs the `GET`/`HEAD` at the
-origin (TLS terminates HERE, at the node, not at the requester), and streams the response back with `Range`
-intact so a resumable download works. It is the smallest honest instance of "run this at a keyed node": a
-fetch, not a general proxy or an open VPN.
+An HTTP origin fetch a keyed node performs on an admitted requester's behalf.
 
-## What it protects against
+`serve_fetch` reads a `FetchRequest` off an already-admitted stream, performs the `GET`/`HEAD` at the
+origin (TLS terminates at this node, not at the requester), and streams the response back with `Range`
+intact, so a resumable download works. It is a fetch scoped to one origin, not a general proxy or an open
+VPN.
 
-The origin is vetted before any connection: only `http`/`https`, and the host must resolve ENTIRELY to
-public addresses. This stops a caller from turning the node into an SSRF pivot, reaching its loopback, its
-LAN, or the cloud metadata endpoint (`169.254.169.254`) to steal instance credentials. The vetted address
-is pinned into the client, so a DNS rebind between the check and the connect cannot swap a public answer for
-a private one. Requests are `GET`/`HEAD` only; redirects are forwarded to the requester verbatim rather than
-followed here, so the client decides.
+## The origin is vetted before the connection
 
-## Origin allowlist (designed, not yet built)
+Only `http` or `https` targets pass, and the host must resolve entirely to public addresses. This stops an
+admitted caller from turning the node into an SSRF pivot: reaching its loopback, its LAN, or the cloud
+metadata endpoint (`169.254.169.254`) to steal instance credentials. The vetted address is pinned into the
+client, so a DNS rebind between the check and the connect cannot swap a public answer for a private one.
 
-Today the REQUESTER names the URL, and the node fetches any origin that passes the SSRF guard above. An
-OPERATOR-side origin allowlist, set at expose time, that constrains the origin-fetch service to a fixed set
-of origins is designed (theia deliberation 13) and coming: it is the control that makes an OPEN
-(unauthenticated) origin-fetch service safe and narrows an admitted delegate's egress (every fetch leaves
-from your IP, so you may not want to hand a delegate your whole public reach). Until it lands, scope the
-service by handing its capability only to peers you trust to egress from your public IP.
+## The operator scopes the origins
 
-## How it composes
+`OriginAllowlist` constrains the service to a fixed set of origins. The operator parses the list at setup
+time; `serve_fetch` refuses a request whose origin is not on it, before any connection and in front of the
+SSRF guard. An empty allowlist is unconstrained: the service may reach any public origin the SSRF guard
+passes.
 
-`fetch` is a service crate: it knows what to DO with an admitted stream, never how the peer was reached or
-gated. The composing consumer wraps `serve_fetch` in a handler and injects it into the tunnel's handler
-registry; the `http` framing is public so the same caller's client side speaks the wire.
+The check is over the normalized `(scheme, host, port)` triple, compared exactly. A request URL carrying
+userinfo (`https://user@host/`) is rejected outright, so it can never be parsed around to a different
+host.
+
+## The entry point
+
+`serve_fetch(writer, reader, &allow)` is the whole engine. The caller owns admission and exposure, and
+decides who may use the service and whether it is open. The `http` module publishes the request and
+response framing, so the caller's client side speaks the same wire.
+
+## Honest limits
+
+- **`GET` and `HEAD` only.** Other methods are refused. Redirects are forwarded to the requester, not
+  followed here: the caller decides whether to follow.
+- **No byte cap on the response body.** An admitted requester can pull as much as the origin serves,
+  bounded only by the caller's stream and session caps.
+- **An empty `OriginAllowlist` is unconstrained.** The SSRF guard still holds, so only public origins
+  pass, but any public origin does.
+- **The allowlist gates the origin only.** The `(scheme, host, port)` triple is checked; the path and
+  query are the requester's to choose.
+- **TLS terminates at the node.** The node handles the request and response in plaintext; the requester
+  trusts the node, not the origin certificate.
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The API changes
+  without notice.
 
 ## License
 
