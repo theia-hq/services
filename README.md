@@ -1,19 +1,25 @@
 # services
 
-Service engines a keyed node runs for a peer: fetch an origin, measure the link, run a shell, receive a file.
+The general theia service engines: the work a keyed node does for a peer on an already-admitted stream.
 
-Each engine is a Rust library that does one job with an already-authorized byte stream. An engine does not know how the peer was reached or how it was gated; the program that embeds it supplies the transport, the identity, and the admission policy. [tightbeam](https://github.com/theia-hq/tightbeam) is the usual assembly, and [swoosh](https://github.com/theia-hq/swoosh) is one program built from these engines.
+Each engine is a Rust library that does one job on a byte stream. An engine never sees how the peer was
+reached or admitted. The embedding program supplies the transport, the identity, and the access policy,
+then hands the engine a stream.
 
-## What each engine does
+## The engines
 
-- **fetch** performs an HTTP `GET`/`HEAD` at an origin on the requester's behalf. `serve_fetch` vets the target before connecting (http/https only, every resolved address public, the vetted address pinned into the client, redirects not followed) and streams the response back with `Range` intact. `OriginAllowlist` scopes the origins an instance may reach.
-- **measure** answers reach diagnostics: `ping` (RTT) and `speed` (throughput). Both ride a small versioned protocol over a [bifrost](https://github.com/theia-hq/bifrost) stream and are transport-blind. A node answers with `answer_ping`/`answer_speed` or a `Responder`; a client runs a `Ping` or `Speedtest`.
-- **sshh** runs a keyless SSH server when handed a stream a real gate already admitted. A standard `ssh` or `scp` client works unchanged, with no SSH keys to manage. `serve` consumes a [nauthy](https://github.com/theia-hq/nauthy) `Admitted` witness, so "authorize before serving" is a compile-time precondition.
-- **transfer** receives a pushed file: one stream, one file, verified end to end with BLAKE3 by `bifrost-wire`, saved under a sink directory. A sender-supplied name is reduced to a safe relative path, so a peer cannot write outside that directory.
+- **fetch**: perform an HTTP `GET`/`HEAD` at an origin for an admitted requester, with the target vetted
+  against SSRF and the operator's `OriginAllowlist`.
+- **measure**: answer `ping` (round-trip time) and `speed` (throughput) tests on a session, or run the
+  same tests from the client side.
+- **sshh**: serve a shell over an admitted stream to a standard `ssh` client, with no SSH keys; the
+  stream's admission is the only credential.
+- **transfer**: receive one pushed file off an admitted stream, verified end to end with BLAKE3 and saved
+  under an output directory.
 
-## Quickstart
+## Build it and run one engine
 
-Clone and run the tests:
+No engine ships a binary; the tests are the runnable examples. Clone, build, and run the suite:
 
 ```sh
 git clone https://github.com/theia-hq/services
@@ -21,29 +27,53 @@ cd services
 cargo test --locked
 ```
 
-Add an engine to a program. Git-only for now, not published to crates.io; pin an exact rev the way the family does:
+The `measure` integration test is the end-to-end example: two in-process nodes, a `ping`, and a `speed`
+test with no sockets involved. Run it alone:
+
+<!-- capture: cargo test --locked -p measure --test reach -->
+```sh
+cargo test --locked -p measure --test reach
+```
+
+```
+running 7 tests
+test a_speed_frame_on_a_ping_only_node_carries_the_unsupported_refusal ... ok
+test a_ping_frame_on_a_speed_only_node_carries_the_unsupported_refusal ... ok
+test bidir_moves_bytes_in_both_directions_at_once ... ok
+test ping_measures_round_trips_with_no_loss ... ok
+test observing_reports_every_probe_in_order_as_it_lands ... ok
+test speed_moves_bytes_in_each_direction ... ok
+test time_bounded_speed_respects_the_duration_not_a_byte_count ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+```
+
+## Embed an engine
+
+Add the crate you need as a git dependency, pinned to an exact commit:
 
 ```toml
 [dependencies]
 fetch = { git = "https://github.com/theia-hq/services", rev = "<40-char commit>" }
 ```
 
-## What is not here
-
-The engines are the work a service does, not the policy around it.
-
-- **No handlers, no registry, no gate.** The `Handler` implementations, their public-use markers, and the gate that admits a peer stay at the composition root. A program serves an engine by wrapping its `serve` function in a handler it owns.
-- **No fetch policy wrapper.** `fetch` is the engine only. The scoped-allowlist wrapper that refuses to open a fetch service with an unconstrained allowlist lives in [swoosh](https://github.com/theia-hq/swoosh), the consumer, with the public-exposure proof it belongs to.
-- **No shell route.** The `sshh` crate is the keyless SSH server engine. The product that arms and exposes a shell service owns that decision and its blast radius.
+Each engine README names its entry point and the policy the caller keeps.
 
 ## Honest limits
 
-- **Experimental.** `0.0.0`, `publish = false`, consumed by exact git revs. The APIs change without notice.
-- **The shell is remote code execution by construction.** The engine refuses to run as root, caps live shells at 64 per process, and demands the `Admitted` witness. Who reaches it, and with what capability, is the embedding program's policy.
-- **`ping`/`speed` answer with unbounded per-request bytes**, bounded only by the session and stream caps. A node that advertises them to strangers consents to that drain.
-- **`transfer` has no byte cap.** An admitted peer can fill the sink directory. Bounding that is the operator's job.
-- **An empty `OriginAllowlist` is unconstrained.** The SSRF guard still holds, so only public origins pass, but any public origin does.
-- **One repo, one rev.** Four engines share a rev; a consumer depends on the crate it needs, and a bump for one engine moves that rev for all four.
+- **The engines are the work, not the policy.** Admission, exposure, and public-use decisions stay in the
+  embedding program. This repo ships no gate, no registry, and no binary.
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The APIs change
+  without notice.
+- **The shell is remote code execution by construction.** `sshh` refuses to run as root, caps live shells
+  at 64 per process, and serves only a stream the caller proves was admitted. Who reaches it, and with
+  what capability, is the embedder's policy.
+- **`measure` and `transfer` set no byte caps, and `fetch` caps no response body.** An admitted peer can
+  move bytes without a bound the engine sets; the embedder's stream and session caps are the only bound.
+- **An empty `OriginAllowlist` is unconstrained.** The SSRF guard still holds, so only public origins
+  pass, but any public origin does.
+- **One repo, one rev.** All four engines share a rev; a bump for one moves the pin for the others. A
+  consumer depends on only the crate it needs.
 
 ## License
 
@@ -56,4 +86,6 @@ at your option.
 
 ### Contribution
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work
+by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional
+terms or conditions.

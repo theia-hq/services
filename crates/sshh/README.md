@@ -1,30 +1,48 @@
 # sshh
 
-A keyless SSH server over an already-authenticated byte stream. theia's equivalent of Tailscale SSH.
+A keyless SSH server over an already-authenticated byte stream.
 
-The caller hands `serve` one stream that a capability-gated overlay has ALREADY mutually authenticated (QUIC
-+ raw-public-key TLS, addressed by ed25519 node id) and encrypted; the peer was authorized by a capability.
-SSH's own transport job is therefore already done, so this server accepts the SSH `none` auth method and
-goes straight to a shell: the capability IS the auth, exactly as Tailscale SSH accepts `none` behind
-WireGuard. A standard `ssh` / `scp` client works unchanged, with no ssh keys to manage.
+`serve` runs one SSH connection on a stream that was already admitted: it accepts the SSH `none` auth
+method and goes straight to a shell, because the stream's admission is the authentication. The host key is
+derived from the node's own identity, so a client's `known_hosts` pins the machine across connections.
 
-## Safety
+## Authorize before serve
 
-A shell has no auth of its own, so everything rests on the stream being pre-authenticated:
+`serve` consumes a `nauthy::Admitted` witness by value, and `Admitted` has no public constructor, so
+"authorize before serve" is a compile-time precondition, not a check the caller remembers to write. The
+witness is single-use: one admission authorizes exactly one connection.
 
-- **The capability is the auth.** Only ever hand `serve` a stream a real gate already admitted, never a raw
-  socket, never an open gate. `serve` demands a `nauthy::Admitted` witness with no public constructor, so
-  "authorize before serve" is a compile-time precondition, not a check you remember to write.
-- **It refuses to run as root**, so a privileged process cannot hand every caller a root shell.
-- **The host key is derived from the node's own identity**, so a client's `known_hosts` pins the machine.
-- **A revoked capability is refused at connect** (revocation plus a short cap TTL is the recall story; it
-  does not cut a session already in progress).
+## What it refuses
 
-## Why its own crate
+- **Root.** A shell served to an admitted peer runs as this process's user, so a privileged process would
+  hand out a root shell. `serve` returns `ServeError::Root` instead.
+- **More than 64 live shells per process.** Past the cap, a new shell request is refused, so an admitted
+  peer cannot fork-bomb the host.
+- **A revoked capability, at connect.** Revocation plus a short capability lifetime is the recall story;
+  it does not cut a session already in progress.
 
-`sshh` lives apart from the byte-moving layer so its heavy, security-sensitive dependency tree (`russh`,
-`ssh-key`, `pty-process`) stays out of a lean, reach-only client. The composing consumer wraps `serve` in a
-gated handler behind its `ssh` feature.
+## The entry point
+
+`serve(admitted, host_seed, writer, reader)` is the whole engine. The caller owns admission and exposure,
+and derives the host-key seed from the node identity with the exported `host_seed(&secret)`.
+
+It is its own crate so the heavy, security-sensitive dependency tree (`russh`, `ssh-key`, `pty-process`)
+stays out of programs that do not serve a shell.
+
+## Honest limits
+
+- **The shell is remote code execution by construction.** The guards bound how many shells run and who can
+  start one; they do not make a shell safe to expose. Who reaches it, and with what capability, is the
+  embedder's policy.
+- **The shell runs as this process's user.** There is no per-user mapping. A standard `ssh` client works
+  unchanged and `scp -O` (the legacy exec mode) works; the SFTP subsystem is not implemented, so `sftp`
+  and the newer SFTP-based `scp` do not.
+- **Unix only.** The pty layer is `rustix`'s Unix pty API, and the root check reads the process's Unix user
+  ids.
+- **Dropping the `serve` future does not abort a live shell.** The SSH session runs on a detached task, so
+  the shell runs until the client disconnects or exits. The live-shell cap bounds how many run at once.
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The API changes
+  without notice.
 
 ## License
 
