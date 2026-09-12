@@ -5,6 +5,8 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Receive a verified pushed file at a keyed node, off an admitted stream."
+repository = "https://github.com/theia-hq/services"
 
 [dependencies]
 # theia

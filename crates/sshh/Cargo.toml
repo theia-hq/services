@@ -5,6 +5,8 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "A keyless SSH server over an already-authenticated byte stream."
+repository = "https://github.com/theia-hq/services"
 
 # A keyless SSH server over an already-authenticated byte stream. Its own crate so its heavy,
 # security-sensitive dependency tree (russh, ssh-key, pty-process) sits behind the composing consumer's

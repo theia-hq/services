@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["crates/fetch", "crates/measure", "crates/sshh", "crates/transfer"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# theia. Each sibling git-dep is pinned to an EXACT rev so a consumer records exactly which
+# bifrost/nauthy commit compiled in, instead of floating on default-branch HEAD. The local dev
+# `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does NOT
+# slow local builds (the patch wins locally regardless of the rev); CI (no parent config) resolves the rev
+# from GitHub. All bifrost-* crates live in one repo, so they share one rev.
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "b872d16bf37a4beddc39c19123a300ee44f26d06" }
+
+eyre = "0.6"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+libc = "0.2"
+pty-process = { version = "0.5.3", features = ["async", "tokio"] }
+russh = "0.63"
+ssh-key = { version = "=0.7.0-rc.11", features = ["ed25519"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+wildcard_imports = "deny"
+std_instead_of_core = "warn"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+# Ship lean release artifacts: strip symbols, whole-program LTO, single codegen unit. Only a longer
+# release link (a CI concern), no runtime cost.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
