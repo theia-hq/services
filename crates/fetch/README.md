@@ -3,9 +3,8 @@
 An HTTP origin fetch a keyed node performs on an admitted requester's behalf.
 
 `serve_fetch` reads a `FetchRequest` off an already-admitted stream, performs the `GET`/`HEAD` at the
-origin (TLS terminates at this node, not at the requester), and streams the response back with `Range`
-intact, so a resumable download works. It is a fetch scoped to one origin, not a general proxy or an open
-VPN.
+origin, and streams the response back with `Range` intact, so a resumable download works. It is a fetch
+scoped to one origin, not a general proxy or an open VPN.
 
 ## The origin is vetted before the connection
 
@@ -18,8 +17,7 @@ client, so a DNS rebind between the check and the connect cannot swap a public a
 
 `OriginAllowlist` constrains the service to a fixed set of origins. The operator parses the list at setup
 time; `serve_fetch` refuses a request whose origin is not on it, before any connection and in front of the
-SSRF guard. An empty allowlist is unconstrained: the service may reach any public origin the SSRF guard
-passes.
+SSRF guard.
 
 The check is over the normalized `(scheme, host, port)` triple, compared exactly. A request URL carrying
 userinfo (`https://user@host/`) is rejected outright, so it can never be parsed around to a different
@@ -39,11 +37,10 @@ response framing, so the caller's client side speaks the same wire.
   bounded only by the caller's stream and session caps.
 - **An empty `OriginAllowlist` is unconstrained.** The SSRF guard still holds, so only public origins
   pass, but any public origin does.
-- **The allowlist gates the origin only.** The `(scheme, host, port)` triple is checked; the path and
-  query are the requester's to choose.
+- **The allowlist gates the origin only.** The path and query are the requester's to choose.
 - **TLS terminates at the node.** The node handles the request and response in plaintext; the requester
   trusts the node, not the origin certificate.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The API changes
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
   without notice.
 
 ## License

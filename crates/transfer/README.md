@@ -23,12 +23,11 @@ the verified length. The caller owns admission and the output directory.
 - **No byte cap.** An admitted sender can fill the output directory. The caller bounds disk.
 - **Receive only.** This crate is the receiver's per-stream work. The sender side (dial, directory walk,
   concurrent streams) is not here.
-- **One file per stream.** A directory push is many calls, one per stream.
 - **A failed transfer is not resumed.** A truncated or tampered transfer is rejected and its temp file is
   removed, so the sender starts that file over.
 - **Concurrent calls need distinct tags.** The tag names the temp file (`.transfer-<pid>-<tag>.part`), so
   two streams that share a tag share a temp path.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed by exact git revs. The API changes
+- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
   without notice.
 
 ## License
