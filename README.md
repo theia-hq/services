@@ -19,9 +19,9 @@ then hands the engine a stream.
 
 ## Build it and run one engine
 
-No engine ships a binary; each ships a runnable example (`crates/measure/examples/reach.rs`). Clone,
-then run it: two in-process nodes over the mem transport, a ping and a speed test, with no sockets
-involved.
+The engines are libraries, with no binary between them. `measure` carries a runnable example
+(`crates/measure/examples/reach.rs`): clone, then run it. Two in-process nodes over the mem transport, a
+ping and a speed test, with no sockets involved.
 
 ```sh
 git clone https://github.com/theia-hq/services
