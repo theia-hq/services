@@ -1,10 +1,11 @@
 # services
 
-The general theia service engines: the work a keyed node does for a peer on an already-admitted stream.
+A collection of tightbeam services. A node serves whichever ones it needs, and each engine does one job on
+an admitted stream.
 
-Each engine is a Rust library that does one job on a byte stream. An engine never sees how the peer was
-reached or admitted. The embedding program supplies the transport, the identity, and the access policy,
-then hands the engine a stream.
+The engines are libraries, and your program keeps the transport, the identity, and the access policy. An
+engine never sees how the peer was reached or admitted; it gets a stream and does its job. Pick the crates
+you want.
 
 ## The engines
 
@@ -19,9 +20,9 @@ then hands the engine a stream.
 
 ## Build it and run one engine
 
-The engines are libraries, with no binary between them. `measure` carries a runnable example
-(`crates/measure/examples/reach.rs`): clone, then run it. Two in-process nodes over the mem transport, a
-ping and a speed test, with no sockets involved.
+The engines are libraries. `measure` carries a runnable example (`crates/measure/examples/reach.rs`):
+clone, then run it. Two in-process nodes over the mem transport, a ping and a speed test, with no sockets
+involved.
 
 ```sh
 git clone https://github.com/theia-hq/services
