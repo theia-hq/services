@@ -8,24 +8,29 @@
 //! open a speed drain even though both speak the same frame. `answer` is the union of both, for the
 //! in-crate responder loop the reach tests drive.
 
+use core::time::Duration;
+
 use bifrost::RefusalDetail;
-use tokio::io;
+use tokio::{io, time};
 
 use crate::payload::Payload;
 use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
 
 /// The responder-side bounds [`crate::server::Speed`] enforces on one speed stream: the largest payload it
-/// will move per direction. `None` is unbounded (the old mirror-the-client behavior), which a caller may
-/// choose only through [`crate::server::Limits::unmetered`] and then owns the banner caveat.
+/// will move per direction and the longest it will run. `None` on either is unbounded (the old
+/// mirror-the-client behavior), which a caller may choose only through
+/// [`crate::server::Limits::unmetered`] and then owns the banner caveat.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SpeedCaps {
     /// The largest payload one direction may move, or `None` for unbounded.
     pub(crate) max_bytes: Option<u64>,
+    /// The longest the stream may run, or `None` for unbounded.
+    pub(crate) max_duration: Option<Duration>,
 }
 
 impl SpeedCaps {
     /// Bound a requested byte count: an explicit request is clamped to the cap, and an unbounded source
-    /// (`None`) becomes the cap itself, so a metered run always terminates on a byte count.
+    /// (`None`) becomes the cap itself, so a metered run always carries its own byte bound.
     pub(crate) fn clamp(&self, limit_bytes: Option<u64>) -> Option<u64> {
         match (self.max_bytes, limit_bytes) {
             (Some(cap), Some(requested)) => Some(requested.min(cap)),
@@ -76,7 +81,18 @@ where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    match Request::read(&mut reader).await? {
+    // One deadline for the whole stream: the request read and the transfer share the cap, so a caller
+    // that stalls before naming a method is bounded too, never parked open until the client stops.
+    let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
+    let request = match deadline {
+        Some(deadline) => match time::timeout_at(deadline, Request::read(&mut reader)).await {
+            Ok(request) => request?,
+            // The cap fired before a method arrived; close cleanly, nothing was served.
+            Err(_past_deadline) => return Ok(()),
+        },
+        None => Request::read(&mut reader).await?,
+    };
+    match request {
         Request::Ping { .. } => {
             refuse(
                 &mut writer,
@@ -85,7 +101,7 @@ where
             )
             .await
         }
-        speed => serve_speed(&mut writer, &mut reader, speed, caps).await,
+        speed => serve_speed(&mut writer, &mut reader, speed, caps, deadline).await,
     }
 }
 
@@ -103,19 +119,20 @@ where
             seq,
             sent_unix_nanos,
         } => echo_pings(&mut writer, &mut reader, seq, sent_unix_nanos).await,
-        speed => serve_speed(&mut writer, &mut reader, speed, SpeedCaps::default()).await,
+        speed => serve_speed(&mut writer, &mut reader, speed, SpeedCaps::default(), None).await,
     }
 }
 
 /// Run one speed transfer for an already-read speed request: drain a sink, source a download, or mirror a
-/// full-duplex run, each clamped to `caps`. Shared by [`answer_speed`] and the union [`answer`], so the
-/// transfer engine has one home. A [`Request::Ping`] is unreachable here (both callers peel it off first)
-/// and refused for completeness.
+/// full-duplex run, each clamped to `caps` and stopped at `deadline` when one is set. Shared by
+/// [`answer_speed`] and the union [`answer`], so the transfer engine has one home. A [`Request::Ping`] is
+/// unreachable here (both callers peel it off first) and refused for completeness.
 async fn serve_speed<W, R>(
     writer: &mut W,
     reader: &mut R,
     request: Request,
     caps: SpeedCaps,
+    deadline: Option<time::Instant>,
 ) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,
@@ -132,9 +149,11 @@ where
         }
         Request::SpeedSink { limit_bytes } => {
             // The sink drains the client's upload, clamped to the cap: a metered node never accepts more
-            // than its configured bound, and the count it reports is the bytes it actually took.
+            // than its configured bound, and the count it reports is the bytes it actually took. A
+            // deadline stop is no exception: the drain returns its partial count and the reply carries
+            // it, so a capped sink is a short count, never a dropped frame.
             let bounded = caps.clamp(Some(limit_bytes)).unwrap_or(limit_bytes);
-            let bytes = Payload::of(bounded).drain(reader).await?;
+            let bytes = drain(reader, Some(bounded), deadline).await?;
             Response::Received { bytes }
                 .write(writer)
                 .await
@@ -145,9 +164,9 @@ where
             // download" from a refusal on its first read; a wrong-method node writes `Unsupported`
             // instead (in `answer_ping`), so the download can never drain a refusal as zero bytes.
             Response::Sourcing.write(writer).await?;
-            // A cap turns an unbounded source into a byte-bounded one, so a metered run always terminates
-            // on the responder's own terms; an unmetered one sources until the client stops.
-            source(writer, caps.clamp(limit_bytes)).await?;
+            // A cap turns an unbounded source into a byte- or time-bounded one, so a metered run always
+            // terminates on the responder's own terms; an unmetered one sources until the client stops.
+            source(writer, caps.clamp(limit_bytes), deadline).await?;
             Ok(())
         }
         Request::SpeedBidir { limit_bytes } => {
@@ -155,11 +174,11 @@ where
             // "sourcing" or a refusal deterministically before any payload, then run both halves.
             Response::Sourcing.write(writer).await?;
             // Full-duplex: drain the client's upload while sourcing our download at once, both clamped to
-            // the same cap. Run both to completion.
+            // the same cap and stopped at the same deadline. Run both to completion.
             let bounded = caps.clamp(limit_bytes);
             let (sourced, drained) = tokio::join!(
-                source(writer, bounded),
-                Payload::of_or_until_peer(bounded).drain(reader),
+                source(writer, bounded, deadline),
+                drain(reader, bounded, deadline),
             );
             sourced?;
             drained?;
@@ -187,18 +206,41 @@ pub(crate) async fn refuse<W: io::AsyncWrite + Unpin>(
     Err(ProtocolError::WrongService)
 }
 
+/// Drain the client's upload to `limit_bytes` (or to EOF when `None`), stopping at `deadline` when one
+/// is set and returning the count taken. A deadline stop keeps the partial count, so a capped sink
+/// reports what it actually took rather than losing the count to the stop.
+async fn drain<R: io::AsyncRead + Unpin>(
+    reader: &mut R,
+    limit_bytes: Option<u64>,
+    deadline: Option<time::Instant>,
+) -> Result<u64, ProtocolError> {
+    Payload::of_or_until_peer(limit_bytes)
+        .drain_within(reader, deadline)
+        .await
+        .map_err(ProtocolError::from)
+}
+
 /// Source counted download payload: an exact `Some(n)` bytes for a byte bound, or unbounded until the
-/// client stops reading for a time bound (its deadline, not a byte count, is the terminator).
+/// client stops reading. Stops at `deadline` when one is set and closes the stream: a capped source is
+/// a truncated close, never an unbounded run.
 async fn source<W: io::AsyncWrite + Unpin>(
     writer: &mut W,
     limit_bytes: Option<u64>,
+    deadline: Option<time::Instant>,
 ) -> io::Result<()> {
     let payload = match limit_bytes {
         Some(bytes) => Payload::of(bytes),
         None => Payload::until_peer_stops(),
     };
-    payload.send(writer).await?;
-    Ok(())
+    match deadline {
+        Some(deadline) => match time::timeout_at(deadline, payload.send(writer)).await {
+            Ok(result) => result.map(|_| ()),
+            // Cancelled at the cap: the stream closes behind a partial payload, so the client reads a
+            // truncated stream, never a hang.
+            Err(_past_deadline) => Ok(()),
+        },
+        None => payload.send(writer).await.map(|_| ()),
+    }
 }
 
 /// Echo the opening ping, then every subsequent ping on the same stream until the client closes it.
@@ -237,3 +279,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "responder_tests.rs"]
+mod responder_tests;
