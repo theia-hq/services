@@ -2,11 +2,12 @@
 //!
 //! ping and speed are TWO independent services, not one: `ping` (cheap RTT) and `speed` (bandwidth-eating
 //! throughput). A node may offer one without the other, and each carries its own gate, so the served
-//! method MUST match the service that admitted the stream. [`crate::server::Ping`] and
-//! [`crate::server::Speed`] are the public entries; the per-stream bodies here are crate-private and each
-//! refuses the other's method at the wire ([`ProtocolError::WrongService`]), so a `ping` grant can never
-//! open a speed drain even though both speak the same frame. `answer` is the union of both, for the
-//! in-crate responder loop the reach tests drive.
+//! method MUST match the service that admitted the stream. [`crate::server::Ping`] / [`crate::server::Speed`]
+//! (owner limits) and [`crate::server::MeteredPing`] / [`crate::server::MeteredSpeed`] (the public safety
+//! caps) are the entries; the per-stream bodies here are crate-private and each refuses the other's method
+//! at the wire ([`ProtocolError::WrongService`]), so a `ping` grant can never open a speed drain even
+//! though both speak the same frame. `answer` is the union of both, for the in-crate responder loop the
+//! reach tests drive.
 
 use core::time::Duration;
 
@@ -17,10 +18,9 @@ use crate::payload::Payload;
 use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
 
 /// The responder-side bounds [`crate::server::Speed`] enforces on one speed stream: the largest payload it
-/// will move per direction and the longest it will run. `None` on either is unbounded (the old
-/// mirror-the-client behavior), which only the crate's test-only union body asks for: the public-capable
-/// [`crate::server::Speed`] fills both caps from [`crate::server::Limits`], which has no unbounded
-/// constructor.
+/// will move per direction and the longest it will run. `None` on either is unbounded: that is the owner
+/// profile's shape, and the test-only union body's. The metered `crate::server::MeteredSpeed` fills both
+/// caps from [`crate::server::Limits::metered`], and no constructor takes another profile.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SpeedCaps {
     /// The largest payload one direction may move, or `None` for unbounded.
@@ -31,10 +31,9 @@ pub(crate) struct SpeedCaps {
 
 /// The responder-side bounds [`crate::server::Ping`] enforces on one ping stream: the largest number of
 /// bytes the stream may move (fixed-width requests plus their echoes) and the longest it may run, from
-/// the opening read through the last echo. `None` on either is unbounded (the old mirror-the-client
-/// behavior), which only the crate's test-only union body asks for: the public-capable
-/// [`crate::server::Ping`] fills both caps from [`crate::server::Limits`], which has no unbounded
-/// constructor.
+/// the opening read through the last echo. `None` on either is unbounded: that is the owner profile's
+/// shape, and the test-only union body's. The metered `crate::server::MeteredPing` fills both caps from
+/// [`crate::server::Limits::metered`], and no constructor takes another profile.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PingCaps {
     /// The largest number of stream bytes one run may move, or `None` for unbounded.
@@ -58,6 +57,18 @@ impl SpeedCaps {
             (None, requested) => requested,
         }
     }
+
+    /// Whether any bound is set. False is the owner profile, which bounds nothing.
+    pub(crate) fn is_metered(&self) -> bool {
+        self.max_bytes.is_some() || self.max_duration.is_some()
+    }
+}
+
+impl PingCaps {
+    /// Whether any bound is set. False is the owner profile, which bounds nothing.
+    pub(crate) fn is_metered(&self) -> bool {
+        self.max_bytes.is_some() || self.max_duration.is_some()
+    }
 }
 
 /// Answer one inbound stream on the `ping` service: echo the opening ping and every probe on it
@@ -69,7 +80,9 @@ impl SpeedCaps {
 /// bounded like the run itself; a capped stream ends with the typed Layer-2 refusal when the stream
 /// still carries a frame, and closes when the peer is no longer reading.
 ///
-/// Crate-private: the entry is [`crate::server::Ping`], which applies the per-caller rate bound first.
+/// Crate-private: the entries are [`crate::server::Ping`] (owner limits) and
+/// [`crate::server::MeteredPing`] (the public safety caps), which apply the per-caller run bound first
+/// when their profile sets one.
 pub(crate) async fn answer_ping<W, R>(
     mut writer: W,
     mut reader: R,
@@ -118,7 +131,8 @@ where
 /// bidir), one per stream, bounded by `caps`. A ping frame is refused with [`ProtocolError::WrongService`]
 /// for symmetry, so a `speed` grant serves only throughput, never a liveness probe on the wrong wall.
 ///
-/// Crate-private: the entry is [`crate::server::Speed`], which holds the transfer slot and the caps.
+/// Crate-private: the entries are [`crate::server::Speed`] (owner limits) and
+/// [`crate::server::MeteredSpeed`] (the public safety caps), which hold the transfer slot and the caps.
 pub(crate) async fn answer_speed<W, R>(
     mut writer: W,
     mut reader: R,
