@@ -1,11 +1,12 @@
 # services
 
-A collection of tightbeam services. A node serves whichever ones it needs, and each engine does one job on
-an admitted stream.
+A collection of engines that serve tightbeam services. A node serves whichever ones it needs, and each
+engine does one job on an admitted stream.
 
-The engines are libraries, and your program keeps the transport, the identity, and the access policy. An
-engine never sees how the peer was reached or admitted; it gets a stream and does its job. Pick the crates
-you want.
+The engines are libraries, and your program keeps the transport, the identity, the gate, and the launcher.
+Each engine ships its own entry: a `Handler` impl that declares the service's exposure ceiling (`Never`, or
+`OptIn` for a service an operator may open deliberately) and its responder-side metering. An engine never
+sees how the peer was reached or admitted; it gets a prepared proof and a stream and does its job.
 
 ## The engines
 
@@ -18,64 +19,45 @@ you want.
 - **[transfer](crates/transfer/README.md)**: receive one pushed file off an admitted stream, verified end to end with BLAKE3 and saved
   under an output directory.
 
-## Build it and run one engine
+## Build it and test it
 
-`measure` carries a runnable example (`crates/measure/examples/reach.rs`): clone, then run it. Two
-in-process nodes over the mem transport, a ping and a speed test, with no sockets involved.
+Clone, then run the tests that cover each engine end to end, refusal paths included:
 
 ```sh
 git clone https://github.com/theia-hq/services
 cd services
-```
-
-<!-- live-run: cargo run --example reach; the timing numbers vary run to run -->
-```sh
-cargo run --example reach
-```
-
-```
-ping: 3 sent, 3 received, 0% loss, rtt min 50.125µs avg 94.736µs max 139.292µs mdev 29.741µs
-speed up: 4.00 MiB in 1.8 ms at 2233.4 MiB/s
-speed down: 4.00 MiB in 1.8 ms at 2233.4 MiB/s
-```
-
-The tests cover each engine end to end, refusal paths included:
-
-```sh
 cargo test --locked
 ```
 
 ## Embed an engine
 
-Add the crates you need as git dependencies:
+Add the engine and the contract as git dependencies:
 
 ```toml
 [dependencies]
-bifrost = { git = "https://github.com/theia-hq/bifrost" }
+tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam" }
 measure = { git = "https://github.com/theia-hq/services" }
 ```
 
-The server side of an engine is a plain function over the stream halves. This is all `measure` needs to
-serve `ping` on a session:
+The engine is the entry: bind the handler value, and a dispatcher (tightbeam's `Router`, or your own
+dispatch over the same contract) proves the route and hands it prepared streams.
 
 ```rust
-use measure::answer_ping;
+use measure::server::{Limits, Ping};
 
-async fn serve<S: bifrost::Session>(session: S) {
-    while let Ok((writer, reader)) = session.accept_bi().await {
-        let _ = answer_ping(writer, reader).await;
-    }
-}
+let limits = Limits::metered();
+router.service("ping".parse()?, Ping::new(&limits))?;
 ```
 
-Each engine README names its entry points and the policy the caller keeps. Git is the only source today, so
+Each engine README names its handler types and the policy the caller keeps. Git is the only source today, so
 pinning a rev is available if you want a fixed point; that choice is the embedder's.
 
 ## Honest limits
 
-- **The engines are the work, not the policy.** Admission, exposure, and public-use decisions stay in the
-  embedding program. This repo ships no gate, no registry, and no binary. Each engine README carries that
-  engine's limits.
+- **The engines ship the ceiling, the root ships the assembly.** Each engine's handler declares its
+  exposure (`Never`, or `OptIn` where an operator may open it deliberately) and its metering. Admission,
+  the open decision, transport, and identity stay in the embedding program. This repo ships no gate, no
+  registry, and no binary. Each engine README carries that engine's limits.
 - **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The APIs change
   without notice.
 - **One repo, one rev.** All four engines share a rev; a bump for one moves the pin for the others. A

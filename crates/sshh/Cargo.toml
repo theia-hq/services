@@ -14,6 +14,7 @@ repository = "https://github.com/theia-hq/services"
 [dependencies]
 blake3 = "1"
 nauthy.workspace = true
+tightbeam-handler.workspace = true
 russh.workspace = true
 ssh-key.workspace = true
 pty-process.workspace = true

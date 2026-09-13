@@ -6,19 +6,23 @@
 //! the smallest honest instance of "run this at a keyed node": a fetch scoped to one origin, not a general
 //! proxy or an open VPN.
 //!
-//! **Origin allowlist.** An operator scopes the service to a fixed set of origins at expose time, and
-//! [`serve_fetch`] refuses any request whose origin is not in
-//! that [`OriginAllowlist`] before it connects. This is the control that makes an OPEN (unauthenticated)
-//! origin-fetch service safe and narrows an admitted delegate's egress. An unscoped service builds an EMPTY
-//! allowlist, which is unconstrained: it fetches any origin that passes the SSRF guard.
+//! **Origin allowlist.** An operator scopes the service to a fixed set of origins at expose time, and the
+//! scoped handler refuses any request whose origin is not in that [`OriginAllowlist`] before it connects.
+//! This is the control that makes an OPEN (unauthenticated) origin-fetch service safe and narrows an admitted
+//! delegate's egress. The unscoped handler carries an EMPTY allowlist, which is unconstrained: it fetches any
+//! origin that passes the SSRF guard.
 //!
 //! It is a service crate: it knows what to DO with an admitted stream, never how the peer was reached or
-//! gated. The composing consumer wraps [`serve_fetch`] in a handler and injects it into the tunnel's handler
-//! registry; the [`http`] framing is public so the same caller's client side speaks the wire.
+//! gated. The composing consumer binds [`Fetch`](crate::Fetch) (unconstrained, never public) or
+//! [`ScopedFetch`](crate::ScopedFetch) (an operator allowlist, opt-in public) into its route table; the
+//! [`http`] framing is public so the same caller's client side speaks the wire.
 
 pub mod http;
 mod origin;
 mod serve;
+
+mod handler;
+pub use handler::{EmptyScope, Fetch, ScopedFetch};
 
 #[cfg(test)]
 mod http_tests;
@@ -27,4 +31,3 @@ mod serve_tests;
 
 pub use crate::http::{FetchRequest, FetchResponse};
 pub use crate::origin::{Origin, OriginAllowlist, compose_url};
-pub use crate::serve::serve_fetch;

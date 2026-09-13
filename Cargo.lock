@@ -167,7 +167,6 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04#a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -177,7 +176,6 @@ dependencies = [
 [[package]]
 name = "bifrost-core"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04#a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -188,7 +186,6 @@ dependencies = [
 [[package]]
 name = "bifrost-mem"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04#a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -199,7 +196,6 @@ dependencies = [
 [[package]]
 name = "bifrost-transport"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04#a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04"
 dependencies = [
  "bifrost-core",
  "tokio",
@@ -208,7 +204,6 @@ dependencies = [
 [[package]]
 name = "bifrost-wire"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04#a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -500,9 +495,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.1"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
  "cfg-if",
 ]
@@ -915,6 +910,8 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "reqwest",
+ "thiserror 2.0.20",
+ "tightbeam-handler",
  "tokio",
 ]
 
@@ -1559,7 +1556,9 @@ dependencies = [
  "bifrost",
  "bifrost-mem",
  "futures",
+ "nauthy",
  "thiserror 2.0.20",
+ "tightbeam-handler",
  "tokio",
  "tracing",
 ]
@@ -1625,7 +1624,6 @@ dependencies = [
 [[package]]
 name = "nauthy"
 version = "0.1.0"
-source = "git+https://github.com/theia-hq/nauthy?rev=b872d16bf37a4beddc39c19123a300ee44f26d06#b872d16bf37a4beddc39c19123a300ee44f26d06"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
@@ -2847,6 +2845,7 @@ dependencies = [
  "russh",
  "ssh-key",
  "thiserror 2.0.20",
+ "tightbeam-handler",
  "tokio",
  "tracing",
 ]
@@ -2954,6 +2953,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "tightbeam-handler"
+version = "0.4.0"
+dependencies = [
+ "bifrost-core",
+ "nauthy",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -3144,7 +3153,9 @@ version = "0.0.0"
 dependencies = [
  "bifrost",
  "eyre",
+ "tightbeam-handler",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3647,3 +3658,23 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "bifrost-iroh"
+version = "0.0.0"
+
+[[patch.unused]]
+name = "bifrost-mdns"
+version = "0.0.0"
+
+[[patch.unused]]
+name = "bifrost-quirk"
+version = "0.0.0"
+
+[[patch.unused]]
+name = "quirk"
+version = "0.0.0"
+
+[[patch.unused]]
+name = "tightbeam"
+version = "0.4.0"

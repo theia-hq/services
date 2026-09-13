@@ -2,7 +2,7 @@
 
 Receive one pushed file at a keyed node, over an admitted stream.
 
-`receive_file` reads one blob off an already-admitted stream, verifies every byte against the sender's
+`Recv` reads one blob off an already-admitted stream, verifies every byte against the sender's
 BLAKE3 root (`bifrost-wire`'s `Transfer`), and moves it into place under an output directory. On any
 failure the temp file is removed, so a rejected or truncated transfer leaves no partial file behind.
 
@@ -15,8 +15,10 @@ stream; a directory's files can arrive in parallel with no fan-out logic in this
 
 ## The entry point
 
-`receive_file(writer, reader, out, tag)` returns `Received { path, bytes }`: the safe relative path and
-the verified length. The caller owns admission and the output directory.
+`Recv::new(out)` is the whole engine: a `Handler` impl whose ceiling is `Never` (a stranger writing files
+into the node's sink has no public use), bound to the `recv:` route. The protocol body is crate-private.
+Each instance owns its sink directory and its per-stream temp tag, so two receive services never share a
+sink and concurrent pushes never contend for the same temp path. The caller owns admission and disk bounds.
 
 ## Honest limits
 

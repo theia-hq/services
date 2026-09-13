@@ -7,15 +7,17 @@
 //! relative path so a peer can never write outside that directory.
 //!
 //! It is a service crate: it knows what to DO with an admitted stream, never how the peer was reached or
-//! gated. The composing consumer wraps [`receive_file`] in a gated handler and injects it
-//! into the tunnel's handler registry, so every pushed file rides the same family gate as every other
-//! service; the sender side (dial, expand directories, pipeline concurrent streams) is a client verb driving
-//! `bifrost-wire` directly.
+//! gated. The composing consumer binds [`Recv`](crate::Recv) into its route table, so every pushed file rides
+//! the same family gate as every other service; the sender side (dial, expand directories, pipeline
+//! concurrent streams) is a client verb driving `bifrost-wire` directly.
 //!
 //! One stream carries one file. The exposer accepts a sender's per-file streams concurrently, so a
 //! directory's files land in parallel with no fan-out logic here: each invocation is one file, start to
 //! finish.
 
+mod handler;
 mod serve;
 
-pub use crate::serve::{receive_file, safe_relative_path};
+pub use handler::Recv;
+
+pub use crate::serve::safe_relative_path;

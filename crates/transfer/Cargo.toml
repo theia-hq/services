@@ -11,9 +11,11 @@ repository = "https://github.com/theia-hq/services"
 [dependencies]
 # theia
 bifrost.workspace = true
+tightbeam-handler.workspace = true
 
 eyre.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
