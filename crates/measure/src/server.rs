@@ -30,19 +30,25 @@ const PING_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const PING_MAP_MAX: usize = 8192;
 /// The largest payload a metered speed run moves per direction, when the caller sets the speed bound.
 const SPEED_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// The longest a metered speed stream may run before the responder stops it, when the caller sets the
+/// speed bound. Sized above a normal diagnostic window (seconds, not minutes) so a bounded run completes,
+/// while a caller-held stream still ends; the byte cap bounds volume, this bounds lifetime.
+const SPEED_MAX_DURATION: Duration = Duration::from_secs(15);
 
 /// The responder-side bounds a measurement service enforces, configured once by the assembly and read by
 /// [`Ping`] and [`Speed`].
 ///
 /// Two constructors: [`metered`](Self::metered) installs this node's default bounds (a one-second probe
-/// interval, one transfer slot, a 64 MiB per-direction cap), and [`unmetered`](Self::unmetered) installs
-/// none, which preserves the old mirror-the-client behavior and carries the `Unmetered` banner caveat. The
-/// two are the operator's deliberate choice, never a default that flips silently.
+/// interval, one transfer slot, a 64 MiB per-direction cap, a 15-second stream cap), and
+/// [`unmetered`](Self::unmetered) installs none, which preserves the old mirror-the-client behavior and
+/// carries the `Unmetered` banner caveat. The two are the operator's deliberate choice, never a default
+/// that flips silently.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     ping_interval: Option<Duration>,
     speed_slots: Option<usize>,
     speed_max_bytes: Option<u64>,
+    speed_max_duration: Option<Duration>,
 }
 
 impl Limits {
@@ -52,6 +58,7 @@ impl Limits {
             ping_interval: Some(PING_MIN_INTERVAL),
             speed_slots: Some(1),
             speed_max_bytes: Some(SPEED_MAX_BYTES),
+            speed_max_duration: Some(SPEED_MAX_DURATION),
         }
     }
 
@@ -61,6 +68,7 @@ impl Limits {
             ping_interval: None,
             speed_slots: None,
             speed_max_bytes: None,
+            speed_max_duration: None,
         }
     }
 
@@ -69,6 +77,7 @@ impl Limits {
         if self.ping_interval.is_some()
             || self.speed_slots.is_some()
             || self.speed_max_bytes.is_some()
+            || self.speed_max_duration.is_some()
         {
             Metering::Metered
         } else {
@@ -80,6 +89,7 @@ impl Limits {
     fn speed_caps(&self) -> SpeedCaps {
         SpeedCaps {
             max_bytes: self.speed_max_bytes,
+            max_duration: self.speed_max_duration,
         }
     }
 }
@@ -160,11 +170,11 @@ impl Handler for Ping {
     }
 }
 
-/// The `speed:` engine: run one transfer per stream, bounded to one concurrent transfer and a per-direction
-/// byte cap.
+/// The `speed:` engine: run one transfer per stream, bounded to one concurrent transfer, a per-direction
+/// byte cap, and a per-stream wall clock.
 ///
 /// A second concurrent caller is refused with the typed busy frame, never queued or given a share of the
-/// uplink; the cap bounds what one run may move in either direction.
+/// uplink; the caps bound what one run may move in either direction and how long it may take.
 pub struct Speed {
     slot: Option<Arc<Semaphore>>,
     caps: SpeedCaps,
@@ -195,8 +205,8 @@ impl Speed {
 
 impl Handler for Speed {
     /// OPT-IN: a member is admitted whole-node, and an operator may deliberately stand behind a public
-    /// throughput responder; a metered one bounds concurrency and bytes, an unmetered one warns on the
-    /// banner.
+    /// throughput responder; a metered one bounds concurrency, bytes, and stream lifetime, an unmetered one
+    /// warns on the banner.
     type Exposure = OptIn;
 
     fn metering(&self) -> Metering {
@@ -242,7 +252,7 @@ const _: () = assert!(<<Speed as Handler>::Exposure as PublicUse>::OPEN_SAFE);
 mod server_tests {
     use tightbeam_handler::Metering;
 
-    use super::{Limits, Ping, Speed};
+    use super::{Limits, Ping, SPEED_MAX_DURATION, Speed};
 
     fn peer(byte: u8) -> nauthy::VerifyKey {
         nauthy::Identity::from_secret(&[byte; 32])
@@ -312,5 +322,16 @@ mod server_tests {
         let unbounded = Limits::unmetered().speed_caps();
         assert_eq!(unbounded.clamp(None), None);
         assert_eq!(unbounded.clamp(Some(7)), Some(7));
+    }
+
+    /// The stream cap rides the limits with the byte cap: metered carries the wall clock, unmetered leaves
+    /// the stream open so a run still mirrors the client.
+    #[test]
+    fn speed_stream_cap_rides_the_limits() {
+        assert_eq!(
+            Limits::metered().speed_caps().max_duration,
+            Some(SPEED_MAX_DURATION)
+        );
+        assert_eq!(Limits::unmetered().speed_caps().max_duration, None);
     }
 }

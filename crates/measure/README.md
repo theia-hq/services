@@ -21,14 +21,15 @@ the test, and return a report.
 
 `server::Ping::new(&limits)` and `server::Speed::new(&limits)` are the whole server side. `limits` is built
 with `Limits::metered()` (a one-second probe interval per caller, one transfer slot, a 64 MiB per-direction
-cap) or `Limits::unmetered()` (mirror the client). The handler reports its metering, so a banner warns when
-an open service is unbounded. The caller owns admission and exposure.
+cap, a 15-second stream cap) or `Limits::unmetered()` (mirror the client). The handler reports its metering,
+so a banner warns when an open service is unbounded. The caller owns admission and exposure.
 
 ## Honest limits
 
-- **Metered bounds are per service instance.** A metered `speed` admits one transfer at a time and clamps
-  each direction to the byte cap; an unmetered one mirrors the client and a node that advertises it to
-  strangers consents to that drain.
+- **Metered bounds are per service instance.** A metered `speed` admits one transfer at a time, clamps
+  each direction to the byte cap, and stops the stream at the wall-clock cap (a capped sink replies with
+  the bytes it took; a capped source closes early); an unmetered one mirrors the client and a node that
+  advertises it to strangers consents to that drain.
 - **Bidir upload is unconfirmed.** Full-duplex mode reports the upload bytes sent; it carries no
   confirmation frame for that leg, because a trailer would corrupt the download stream. A reliable stream
   delivers what was sent.
