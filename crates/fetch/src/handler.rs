@@ -4,11 +4,17 @@
 //! egress relay with no legitimate public use, so its ceiling is [`Never`]. [`ScopedFetch`] carries a
 //! non-empty operator allowlist, which is a deliberate, bounded public use, so its ceiling is [`OptIn`]. The
 //! fetch body stays crate-private; these impls are the entries.
+//!
+//! The public-shape bounds ride [`ScopedFetch`] BY CONSTRUCTION: every scoped fetch enforces the response
+//! cap and the total timeout, and the constructor takes no way to drop them, so a public route cannot bind
+//! an unbounded scoped fetch. The unscoped [`Fetch`] is member-only (`Never`), so the caps do not apply and
+//! it streams unbounded.
 
 use tightbeam_handler::open_policy::{Never, OptIn, PublicUse};
-use tightbeam_handler::{BoxRead, BoxWrite, Handler, ServeError, Served};
+use tightbeam_handler::{BoxRead, BoxWrite, Handler, Metering, ServeError, Served};
 
 use crate::origin::OriginAllowlist;
+use crate::serve::Limits;
 
 /// The unscoped `fetch:` engine: any origin that passes the SSRF guard, with no operator scope.
 pub struct Fetch;
@@ -24,19 +30,28 @@ impl Handler for Fetch {
         mut writer: BoxWrite,
         mut reader: BoxRead,
     ) -> Result<(), ServeError> {
-        crate::serve::serve_fetch(&mut writer, &mut reader, &OriginAllowlist::default()).await?;
+        // Member-only (`Never`), so the public-shape bounds do not apply: stream the origin unbounded.
+        crate::serve::serve_fetch(
+            &mut writer,
+            &mut reader,
+            &OriginAllowlist::default(),
+            Limits::unmetered(),
+        )
+        .await?;
         Ok(())
     }
 }
 
-/// The scoped `fetch:` engine: an operator-bounded origin allowlist, never empty.
+/// The scoped `fetch:` engine: an operator-bounded origin allowlist, never empty, with the responder-side
+/// bounds applied by construction.
 pub struct ScopedFetch {
     allow: OriginAllowlist,
 }
 
 impl ScopedFetch {
     /// Scope the engine to `allow`. A non-empty allowlist is required: an empty one is unconstrained (the
-    /// unscoped [`Fetch`]), which has no legitimate public use.
+    /// unscoped [`Fetch`]), which has no legitimate public use. The bounds are not configurable: every
+    /// scoped fetch carries the metered response cap and total timeout.
     pub fn new(allow: OriginAllowlist) -> Result<Self, EmptyScope> {
         if allow.is_unconstrained() {
             return Err(EmptyScope);
@@ -50,13 +65,19 @@ impl Handler for ScopedFetch {
     /// fetch is a use an operator may deliberately stand behind.
     type Exposure = OptIn;
 
+    /// METERED by construction: the engine always applies the response cap and the total timeout, and no
+    /// constructor drops them, so a public route cannot bind it unbounded.
+    fn metering(&self) -> Metering {
+        Metering::Metered
+    }
+
     async fn serve(
         &self,
         _served: Served<Self>,
         mut writer: BoxWrite,
         mut reader: BoxRead,
     ) -> Result<(), ServeError> {
-        crate::serve::serve_fetch(&mut writer, &mut reader, &self.allow).await?;
+        crate::serve::serve_fetch(&mut writer, &mut reader, &self.allow, Limits::metered()).await?;
         Ok(())
     }
 }
@@ -76,7 +97,9 @@ const _: () = assert!(<<ScopedFetch as Handler>::Exposure as PublicUse>::OPEN_SA
 
 #[cfg(test)]
 mod handler_tests {
-    use super::{OriginAllowlist, ScopedFetch};
+    use tightbeam_handler::{Handler as _, Metering};
+
+    use super::{Fetch, OriginAllowlist, ScopedFetch};
 
     /// The scoped constructor refuses the unconstrained allowlist, so the `OptIn` ceiling cannot be claimed
     /// by an engine that could fetch anywhere.
@@ -93,5 +116,17 @@ mod handler_tests {
             .is_ok(),
             "a non-empty allowlist scopes the engine"
         );
+    }
+
+    /// The scoped engine is metered by construction: every scoped fetch reports `Metered`, because the
+    /// constructor takes no way to drop the caps. The unscoped member-only engine reports `Unmetered`.
+    #[test]
+    fn a_scoped_fetch_is_metered_by_construction() {
+        let scoped = ScopedFetch::new(
+            OriginAllowlist::parse(["https://news.example"]).expect("the origin parses"),
+        )
+        .expect("a non-empty scope");
+        assert_eq!(scoped.metering(), Metering::Metered);
+        assert_eq!(Fetch.metering(), Metering::Unmetered);
     }
 }
