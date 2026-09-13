@@ -133,6 +133,11 @@ impl MethodRefusal {
 }
 
 impl Request {
+    /// The wire size of a [`Ping`](Self::Ping) request: magic, tag, sequence, and nonce. A ping frame
+    /// is fixed-width, so a stream's counted bytes and its frame count bound the same run; the byte
+    /// ceiling on a ping stream charges this per probe.
+    pub(crate) const PING_BYTES: u64 = (MAGIC.len() + 1 + 4 + 8) as u64;
+
     /// Write the framed request: magic, tag, then the variant's fields.
     pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&MAGIC).await?;
@@ -235,6 +240,10 @@ pub enum Response {
 }
 
 impl Response {
+    /// The wire size of a [`Pong`](Self::Pong): tag, sequence, and nonce (a reply carries no magic).
+    /// The byte ceiling on a ping stream charges this per echo.
+    pub(crate) const PONG_BYTES: u64 = 1 + 4 + 8;
+
     /// Write the response frame (no magic: a response is only ever read on a stream we opened).
     pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         match self {

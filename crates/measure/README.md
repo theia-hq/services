@@ -20,16 +20,23 @@ the test, and return a report.
 ## The entry point
 
 `server::Ping::new(&limits)` and `server::Speed::new(&limits)` are the whole server side. `limits` is built
-with `Limits::metered()` (a one-second probe interval per caller, one transfer slot, a 64 MiB per-direction
-cap, a 15-second stream cap) or `Limits::unmetered()` (mirror the client). The handler reports its metering,
-so a banner warns when an open service is unbounded. The caller owns admission and exposure.
+with `Limits::metered()`: a one-second probe interval per caller, a 60-second and 1 GiB ping stream cap,
+one transfer slot, a 64 MiB per-direction speed cap, and a 15-second speed stream cap. `Limits` has no
+unbounded constructor and every bound is non-optional, so the public-capable engines are metered by
+construction: no assembly can stand an uncapped `ping` or `speed`, and the banner never carries the
+unmetered caveat for them. The caller owns admission and exposure.
 
 ## Honest limits
 
+- **Ping and speed are metered by construction.** `Limits::metered()` is the only way to build either
+  engine and every bound is non-optional, so the guard is structural, not an assembly choice: an open
+  `ping`/`speed` route is always capped, and the unmetered banner caveat can never apply to one.
 - **Metered bounds are per service instance.** A metered `speed` admits one transfer at a time, clamps
   each direction to the byte cap, and stops the stream at the wall-clock cap (a capped sink replies with
-  the bytes it took; a capped source closes early); an unmetered one mirrors the client and a node that
-  advertises it to strangers consents to that drain.
+  the bytes it took; a capped source closes early).
+- **A metered ping stream ends at its cap.** At 60 seconds or the 1 GiB byte ceiling, whichever comes
+  first, the responder writes a typed refusal and closes; a client reads that as a refusal, never a silent
+  close folded into loss. A client that stopped reading sees only the close.
 - **Bidir upload is unconfirmed.** Full-duplex mode reports the upload bytes sent; it carries no
   confirmation frame for that leg, because a trailer would corrupt the download stream. A reliable stream
   delivers what was sent.
