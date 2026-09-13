@@ -9,10 +9,11 @@ description = "An HTTP origin fetch a keyed node performs on an admitted request
 repository = "https://github.com/theia-hq/services"
 
 [dependencies]
+tightbeam-handler.workspace = true
+
 futures.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror.workspace = true
-tightbeam-handler.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "time"] }
 tracing.workspace = true
 

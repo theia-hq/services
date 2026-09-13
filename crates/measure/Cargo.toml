@@ -10,10 +10,11 @@ repository = "https://github.com/theia-hq/services"
 
 [dependencies]
 bifrost.workspace = true
-futures.workspace = true
 nauthy.workspace = true
-thiserror.workspace = true
 tightbeam-handler.workspace = true
+
+futures.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "sync", "time"] }
 tracing.workspace = true
 
