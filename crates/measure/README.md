@@ -38,6 +38,9 @@ only ones the proof will open. The caller owns admission.
 - **Metered bounds are per service instance.** A metered `speed` admits one transfer at a time, clamps
   each direction to the byte cap, and stops the stream at the wall-clock cap (a capped sink replies with
   the bytes it took; a capped source closes early). An owner `speed` bounds neither and takes no slot.
+- **An owner diagnostic has no caps of its own.** The serving transport's session and stream table (256
+  sessions, 256 streams per session) is the only bound, so a member admitted by the gate can drain the
+  uplink. An open route binds the metered engines.
 - **A metered ping stream ends at its cap.** At 60 seconds or the 1 GiB byte ceiling, whichever comes
   first, the responder writes a typed refusal and closes; a client reads that as a refusal, never a silent
   close folded into loss. A client that stopped reading sees only the close. The per-caller interval gates

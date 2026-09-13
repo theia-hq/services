@@ -50,6 +50,8 @@ impl Handler for Recv {
         // The arrival as ONE structured event: the fields carry the facts (the safe relative path,
         // escaped and capped because a peer supplies it, and the verified byte count), and a composing
         // program's subscriber decides whether and how to render them. No user-facing prose lives here.
+        // The formatted line is for humans: the peer's own characters ride the path field, so a program
+        // reads the structured fields, never parses the text.
         let path = render_path(&received.path);
         tracing::info!(
             path = %path,
@@ -60,27 +62,28 @@ impl Handler for Recv {
     }
 }
 
-/// Render a peer-supplied path for the activity event: escape control characters and cap the rendered
-/// length. A raw newline forges a log line, a carriage return rewrites one, and ESC drives a terminal, so
-/// none may reach the event as-is. `char::escape_debug` escapes those and leaves printable text, including
-/// non-ASCII names, alone.
+/// Render a peer-supplied path for a log line: escape control characters and cap the rendered length. A
+/// raw newline forges a log line, a carriage return rewrites one, and ESC drives a terminal, so none may
+/// reach a line as-is. Escapes are rendered whole: when the next complete escape would pass the cap, the
+/// render appends the cut marker and stops, so the cut never lands inside a sequence. `char::escape_debug`
+/// leaves printable text alone except grapheme-extended marks, which it escapes (a combining accent
+/// renders as `\u{...}`; an emoji passes raw).
 ///
 /// INTERIM (delib-63): the engine renders here only because the root-owned typed sink does not exist yet;
 /// once the root renderer lands it owns this rule, and this helper moves with it.
-fn render_path(path: &Path) -> String {
+pub(crate) fn render_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     // The cap plus the `...` cut marker: allocation is bounded whatever the peer names.
     let mut rendered = String::with_capacity(MAX_RENDERED_PATH + 3);
     let mut written = 0usize;
-    'chars: for ch in raw.chars() {
-        for escaped in ch.escape_debug() {
-            if written == MAX_RENDERED_PATH {
-                rendered.push_str("...");
-                break 'chars;
-            }
-            rendered.push(escaped);
-            written += 1;
+    for ch in raw.chars() {
+        let width = ch.escape_debug().count();
+        if written + width > MAX_RENDERED_PATH {
+            rendered.push_str("...");
+            break;
         }
+        rendered.extend(ch.escape_debug());
+        written += width;
     }
     rendered
 }

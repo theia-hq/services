@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use bifrost::wire::Transfer;
 use tokio::io::{self, AsyncWriteExt as _};
 
+use crate::handler::render_path;
+
 /// Receive one pushed file over an admitted stream: stream it into a temp file under `out`, verify it end
 /// to end (`bifrost-wire` checks every byte against the sender's BLAKE3 root), then move it into place at
 /// the safe relative path the sender named. On any failure the temp file is removed, so a rejected or
@@ -49,9 +51,11 @@ where
     if let Some(parent) = final_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    // The error text is logged by the serve loop at warn, so the peer-supplied path renders through the
+    // same escape/cap helper as the success event: a raw newline or ESC may not ride the warn line.
     tokio::fs::rename(&temp, &final_path)
         .await
-        .map_err(|err| eyre::eyre!("save to {}: {err}", final_path.display()))?;
+        .map_err(|err| eyre::eyre!("save to {}: {err}", render_path(&final_path)))?;
 
     Ok(Received {
         path: relative,
