@@ -9,34 +9,39 @@ works over iroh, an in-process transport, or any future transport.
 
 ## Two services, one crate
 
-`ping` and `speed` are independent services: a node can answer one without the other. The served entries
-are `server::Ping` and `server::Speed`, two `Handler` impls behind their own gates, each refusing the
-other's method with a typed refusal on the wire, so a wrong-method dial surfaces as an error, never as `0`
-bytes or `100%` loss. The per-stream protocol bodies are crate-private.
+`ping` and `speed` are independent services: a node can answer one without the other. Each has an owner
+entry and a metered entry: `server::Ping` / `server::Speed` are `Handler` impls for family routes (owner
+limits, never public), `server::MeteredPing` / `server::MeteredSpeed` are the public-capable ones (the
+safety caps by construction). Each refuses the other's method with a typed refusal on the wire, so a
+wrong-method dial surfaces as an error, never as `0` bytes or `100%` loss. The per-stream protocol bodies
+are crate-private.
 
 On the client side, `Ping { count, interval }` and `Speedtest::new(mode, limit)` each open one stream, run
 the test, and return a report.
 
 ## The entry point
 
-`server::Ping::new(&limits)` and `server::Speed::new(&limits)` are the whole server side. `limits` is built
-with `Limits::metered()`: a one-second probe interval per caller, a 60-second and 1 GiB ping stream cap,
-one transfer slot, a 64 MiB per-direction speed cap, and a 15-second speed stream cap. `Limits` has no
-unbounded constructor and every bound is non-optional, so the public-capable engines are metered by
-construction: no assembly can stand an uncapped `ping` or `speed`, and the banner never carries the
-unmetered caveat for them. The caller owns admission and exposure.
+`server::Ping::new(&limits)` and `server::Speed::new(&limits)` are the family entries: bind them at
+`Limits::owner()` (no responder-side bound; the gate is the terminator). `server::MeteredPing::new()` and
+`server::MeteredSpeed::new()` are the public entries: they carry the safety caps by construction (a
+one-second ping-run interval per caller, a 60-second and 1 GiB ping stream cap, one transfer slot, a
+64 MiB per-direction speed cap, and a 15-second speed stream cap) and take no profile, so an open
+`ping`/`speed` route cannot be armed uncapped. The owner engines declare `Never`, so the public proof
+refuses them even if a hand-assembled router names one; the metered engines declare `OptIn` and are the
+only ones the proof will open. The caller owns admission.
 
 ## Honest limits
 
-- **Ping and speed are metered by construction.** `Limits::metered()` is the only way to build either
-  engine and every bound is non-optional, so the guard is structural, not an assembly choice: an open
-  `ping`/`speed` route is always capped, and the unmetered banner caveat can never apply to one.
+- **Exposure-coupled metering, by type.** The metered engines are the only openable ones and always carry
+  the caps; the owner engines are unbounded and can never be opened. That coupling is structural, not an
+  assembly choice.
 - **Metered bounds are per service instance.** A metered `speed` admits one transfer at a time, clamps
   each direction to the byte cap, and stops the stream at the wall-clock cap (a capped sink replies with
-  the bytes it took; a capped source closes early).
+  the bytes it took; a capped source closes early). An owner `speed` bounds neither and takes no slot.
 - **A metered ping stream ends at its cap.** At 60 seconds or the 1 GiB byte ceiling, whichever comes
   first, the responder writes a typed refusal and closes; a client reads that as a refusal, never a silent
-  close folded into loss. A client that stopped reading sees only the close.
+  close folded into loss. A client that stopped reading sees only the close. The per-caller interval gates
+  ping RUNS (one admitted stream each), not the probes inside a run; an owner ping spaces nothing.
 - **Bidir upload is unconfirmed.** Full-duplex mode reports the upload bytes sent; it carries no
   confirmation frame for that leg, because a trailer would corrupt the download stream. A reliable stream
   delivers what was sent.

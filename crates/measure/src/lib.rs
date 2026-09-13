@@ -7,9 +7,11 @@
 //! the payoff: speed is iperf, but over any transport, a built-in transport dyno.
 //!
 //! ping and speed are TWO independent services, so a node may advertise one without the other: `ping`
-//! (cheap RTT) and `speed` (bandwidth-eating throughput). The served entries are [`server::Ping`] and
-//! [`server::Speed`], each behind its own gate and each refusing the other's method at the wire. A client
-//! constructs a [`Ping`] or [`Speedtest`], runs it against a session, and reads back a report.
+//! (cheap RTT) and `speed` (bandwidth-eating throughput). The served entries are [`server::Ping`] /
+//! [`server::Speed`] (family routes, owner limits, never public) and [`server::MeteredPing`] /
+//! [`server::MeteredSpeed`] (public routes, the safety caps by construction), each behind its own gate
+//! and each refusing the other's method at the wire. A client constructs a [`Ping`] or [`Speedtest`],
+//! runs it against a session, and reads back a report.
 
 pub mod ping;
 pub mod protocol;
