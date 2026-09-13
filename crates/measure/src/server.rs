@@ -84,7 +84,10 @@ impl Limits {
     }
 
     /// The owner profile: effectively unbounded. A family route's gate is the terminator, so the
-    /// diagnostic mirrors the client: no ping-run interval, no stream caps, no slot bound.
+    /// diagnostic mirrors the client: no ping-run interval, no stream caps, no slot bound. What remains
+    /// is the serving transport's session and stream table (256 sessions, 256 streams per session), so an
+    /// admitted member can hold every stream and drain the uplink. Bind the owner engines only behind a
+    /// family gate; an open route binds a metered engine.
     pub fn owner() -> Self {
         Self {
             ping_interval: None,
@@ -426,6 +429,48 @@ mod server_tests {
         assert_eq!(MeteredSpeed::new().metering(), Metering::Metered);
         assert_eq!(Ping::new(&Limits::owner()).metering(), Metering::Unmetered);
         assert_eq!(Speed::new(&Limits::owner()).metering(), Metering::Unmetered);
+    }
+
+    /// The public wrappers carry the metered caps through their own fields: the assertions read the
+    /// wrapped engine and drive its observable bound, so swapping either wrapper's interior to owner
+    /// limits fails here rather than only at the hardcoded `metering()` report.
+    #[test]
+    fn the_metered_wrappers_carry_the_caps_by_construction() {
+        let ping = MeteredPing::new();
+        assert_eq!(ping.metering(), Metering::Metered);
+        assert!(
+            ping.ping.interval.is_some(),
+            "the metered wrapper carries the ping run interval"
+        );
+        assert!(
+            ping.ping.caps.is_metered(),
+            "the metered wrapper carries the ping stream caps"
+        );
+        assert!(ping.ping.admits(peer(1)), "the first run is admitted");
+        assert!(
+            !ping.ping.admits(peer(1)),
+            "a second run inside the interval is refused through the wrapper"
+        );
+
+        let speed = MeteredSpeed::new();
+        assert_eq!(speed.metering(), Metering::Metered);
+        assert!(
+            speed.speed.slot.is_some(),
+            "the metered wrapper carries the speed transfer slot"
+        );
+        assert!(
+            speed.speed.caps.is_metered(),
+            "the metered wrapper carries the speed stream caps"
+        );
+        let held = speed
+            .speed
+            .acquire_slot()
+            .expect("the first transfer takes the slot");
+        assert!(held.is_some(), "the wrapper's slot is a real bound");
+        assert!(
+            speed.speed.acquire_slot().is_err(),
+            "a second concurrent transfer is refused through the wrapper"
+        );
     }
 
     /// The owner profile bounds nothing, on either service.
