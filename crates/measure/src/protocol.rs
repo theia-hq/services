@@ -95,7 +95,9 @@ pub enum MethodRefusal {
     /// The service does not serve the requested method (a ping frame on `speed`).
     #[error("this service does not serve that method")]
     WrongMethod,
-    /// The service serves the method but is at its rate limit for this caller.
+    /// The service serves the method but hit a responder-side bound on this run: per-caller rate
+    /// limiting, or the ping stream's byte ceiling or lifetime cap. The bounded detail names which;
+    /// the code is the coarse branch (stop the run, report the refusal).
     #[error("rate limited")]
     RateLimited,
     /// The service serves the method but is busy right now (a transfer slot).
