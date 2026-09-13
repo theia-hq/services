@@ -67,7 +67,11 @@ impl Ping {
                 }
                 // A refusal is NOT a lost probe: the node does not serve ping, so short-circuit the whole
                 // run with the typed error rather than reading it as loss. No report is built from it.
-                Err(error @ ProtocolError::Refused(_)) => return Err(error),
+                // A refusal code this client does not know is the same class: it arrived in a refusal
+                // frame, so it must surface as a protocol error, never fold into loss.
+                Err(error @ (ProtocolError::Refused(_) | ProtocolError::UnknownRefusalCode(_))) => {
+                    return Err(error);
+                }
                 Err(error) => {
                     tracing::warn!(%error, seq, "ping probe lost");
                     None

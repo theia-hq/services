@@ -6,6 +6,7 @@ use core::time::Duration;
 
 use bifrost::{Error, NoDiscovery, Node, Session as _};
 use bifrost_mem::MemTransport;
+use tokio::io::AsyncWriteExt as _;
 
 use crate::responder::{PingCaps, SpeedCaps, answer, answer_ping, answer_speed};
 use crate::{Limit, MethodRefusal, Mode, Ping, ProtocolError, Refusal, Speedtest};
@@ -277,6 +278,45 @@ async fn a_ping_frame_on_a_speed_only_node_carries_the_unsupported_refusal() {
             }))
         ),
         "a ping frame on a speed-only node must decode a typed wrong-method refusal, not report 100% loss: {refused:?}"
+    );
+
+    drop(session);
+    serving.abort();
+}
+
+#[tokio::test]
+async fn an_unknown_refusal_code_is_an_error_not_loss() {
+    // A refusal frame whose code is past the last one this client knows (a code a future responder
+    // could send) is still a refusal: it must short-circuit the run as a typed protocol error, never
+    // fold into the loss the client reports for a missing pong. Folding it would report a refusal as a
+    // measured packet drop. The frame is hand-built because no handler emits an unknown code.
+    let responder = Node::new(MemTransport::bind(), NoDiscovery);
+    let responder_id = responder.node_id();
+    let client = Node::new(MemTransport::bind(), NoDiscovery);
+
+    let serving = tokio::spawn(async move {
+        let Ok(session) = responder.accept().await else {
+            return;
+        };
+        if let Ok((mut writer, _reader)) = session.accept_bi().await {
+            // Response::Unsupported (0x03) carrying a method-refusal code past BUSY (0x02).
+            let _ = writer.write_all(&[0x03, 0x03]).await;
+        }
+    });
+
+    let session = client
+        .connect(responder_id)
+        .await
+        .expect("client should reach the responder");
+    let outcome = Ping {
+        count: 3,
+        interval: Duration::from_millis(1),
+    }
+    .run(&session)
+    .await;
+    assert!(
+        matches!(outcome, Err(ProtocolError::UnknownRefusalCode(0x03))),
+        "an unknown refusal code must surface as a protocol error, not a loss report: {outcome:?}"
     );
 
     drop(session);
