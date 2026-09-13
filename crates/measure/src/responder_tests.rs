@@ -9,7 +9,8 @@ use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 use tokio::time;
 
 use super::{
-    PING_BYTE_CAP_DETAIL, PING_TIME_CAP_DETAIL, PingCaps, SpeedCaps, answer_ping, answer_speed,
+    PING_BYTE_CAP_DETAIL, PING_TIME_CAP_DETAIL, PingCaps, SPEED_BYTE_CAP_DETAIL, SpeedCaps,
+    answer_ping, answer_speed,
 };
 use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
 
@@ -24,6 +25,15 @@ fn capped_at(duration: Duration) -> SpeedCaps {
     SpeedCaps {
         max_bytes: Some(u64::MAX),
         max_duration: Some(duration),
+    }
+}
+
+/// Caps with a real byte ceiling and a wall clock wide enough that only the byte cap decides, so an
+/// over-cap ask and a full-size run are separated without advancing the clock.
+fn capped_at_bytes(cap: u64) -> SpeedCaps {
+    SpeedCaps {
+        max_bytes: Some(cap),
+        max_duration: Some(Duration::from_secs(15)),
     }
 }
 
@@ -143,6 +153,138 @@ async fn a_capped_sink_reports_the_bytes_it_took() {
         ),
         other => panic!("a capped sink must report its partial count, got {other:?}"),
     }
+}
+
+/// An ask over the byte cap is refused BEFORE the payload: the reply to the request frame is the typed
+/// Layer-2 refusal, never a `Sourcing` go-ahead followed by a truncated stream the client waits on or
+/// counts as measured bytes.
+#[tokio::test(start_paused = true)]
+async fn an_over_cap_source_request_is_refused_before_the_payload() {
+    let cap = 8 * 1024u64;
+    for request in [
+        Request::SpeedSource {
+            limit_bytes: Some(cap + 1),
+        },
+        Request::SpeedBidir {
+            limit_bytes: Some(cap + 1),
+        },
+    ] {
+        let (mut client, serving) = serve(capped_at_bytes(cap));
+        request
+            .write(&mut client)
+            .await
+            .expect("the request frame fits the stream");
+        match Response::read(&mut client)
+            .await
+            .expect("the refusal frame")
+        {
+            Response::Unsupported { code, detail } => {
+                assert_eq!(code, MethodRefusal::RateLimited);
+                assert_eq!(detail.as_str(), SPEED_BYTE_CAP_DETAIL);
+            }
+            other => {
+                panic!("an over-cap request must be refused before the payload, got {other:?}")
+            }
+        }
+        // `refuse` answers with the typed frame, then fails the stream task so the server logs why.
+        let result = serving.await.expect("the responder task does not panic");
+        assert!(
+            matches!(result, Err(ProtocolError::WrongService)),
+            "a refused request ends the stream task: {result:?}"
+        );
+    }
+}
+
+/// An over-cap sink ask is refused BEFORE the drain: the responder never reads the payload the client
+/// would otherwise send into a stream it stopped reading, and the client reads a typed refusal where it
+/// reads the count frame.
+#[tokio::test(start_paused = true)]
+async fn an_over_cap_sink_request_is_refused_before_the_drain() {
+    let cap = 8 * 1024u64;
+    let (mut client, serving) = serve(capped_at_bytes(cap));
+
+    Request::SpeedSink {
+        limit_bytes: cap + 1,
+    }
+    .write(&mut client)
+    .await
+    .expect("the request frame fits the stream");
+    match Response::read(&mut client)
+        .await
+        .expect("the refusal frame")
+    {
+        Response::Unsupported { code, detail } => {
+            assert_eq!(code, MethodRefusal::RateLimited);
+            assert_eq!(detail.as_str(), SPEED_BYTE_CAP_DETAIL);
+        }
+        other => panic!("an over-cap sink must be refused before the drain, got {other:?}"),
+    }
+
+    // `refuse` answers with the typed frame, then fails the stream task so the server logs why.
+    let result = serving.await.expect("the responder task does not panic");
+    assert!(
+        matches!(result, Err(ProtocolError::WrongService)),
+        "a refused sink ends the stream task: {result:?}"
+    );
+}
+
+/// The `u64::MAX` ceiling a time-bounded upload sends is not an over-cap ask: it reads as "no exact
+/// count", so the drain clamps it to the cap instead (refusing it would refuse every `-t` upload).
+#[tokio::test(start_paused = true)]
+async fn a_time_bounded_sink_ceiling_is_not_an_over_cap_ask() {
+    let cap = 8 * 1024u64;
+    let (mut client, serving) = serve(capped_at_bytes(cap));
+
+    Request::SpeedSink {
+        limit_bytes: u64::MAX,
+    }
+    .write(&mut client)
+    .await
+    .expect("the request frame fits the stream");
+    let sent = 4 * 1024u64;
+    client
+        .write_all(&vec![0u8; sent as usize])
+        .await
+        .expect("the upload fits the stream");
+
+    let result = serving.await.expect("the responder task does not panic");
+    assert!(result.is_ok(), "a clamped sink returns Ok: {result:?}");
+    match Response::read(&mut client).await.expect("the count frame") {
+        Response::Received { bytes } => assert_eq!(
+            bytes, sent,
+            "the sink reports the bytes it actually took, not a refusal"
+        ),
+        other => panic!("a time-bounded ceiling is served, not refused, got {other:?}"),
+    }
+}
+
+/// A source request exactly at the cap is served: the cap is the largest ask that fits, and a full-size
+/// run delivers every byte.
+#[tokio::test(start_paused = true)]
+async fn a_source_request_at_the_cap_is_served() {
+    let cap = 4 * 1024u64;
+    let (mut client, serving) = serve(capped_at_bytes(cap));
+
+    Request::SpeedSource {
+        limit_bytes: Some(cap),
+    }
+    .write(&mut client)
+    .await
+    .expect("the request frame fits the stream");
+    assert_eq!(
+        Response::read(&mut client)
+            .await
+            .expect("the go-ahead frame"),
+        Response::Sourcing
+    );
+    let mut received = vec![0u8; cap as usize];
+    client
+        .read_exact(&mut received)
+        .await
+        .expect("a full-size run delivers every byte");
+
+    let result = serving.await.expect("the responder task does not panic");
+    assert!(result.is_ok(), "a request at the cap completes: {result:?}");
 }
 
 /// A ping stream whose client goes silent after the first probe must end at the wall-clock cap, not run

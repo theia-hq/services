@@ -15,7 +15,7 @@ use bifrost::RefusalDetail;
 use tokio::{io, time};
 
 use crate::payload::Payload;
-use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
+use crate::protocol::{MethodRefusal, ProtocolError, Request, Response, UNBOUNDED};
 
 /// The responder-side bounds [`crate::server::Speed`] enforces on one speed stream: the largest payload it
 /// will move per direction and the longest it will run. `None` on either is unbounded: that is the owner
@@ -46,6 +46,9 @@ pub(crate) struct PingCaps {
 const PING_BYTE_CAP_DETAIL: &str = "ping stream reached its byte cap, reconnect to continue";
 /// The refusal a ping stream ends with when its wall clock stops it.
 const PING_TIME_CAP_DETAIL: &str = "ping stream reached its lifetime cap, reconnect to continue";
+/// The refusal a speed run is answered with when its request asks for more bytes than the byte cap
+/// allows. The run would cross the cap, so it is refused BEFORE any payload instead of truncated.
+const SPEED_BYTE_CAP_DETAIL: &str = "speed request is over the byte cap, request fewer bytes";
 
 impl SpeedCaps {
     /// Bound a requested byte count: an explicit request is clamped to the cap, and an unbounded source
@@ -56,6 +59,14 @@ impl SpeedCaps {
             (Some(cap), None) => Some(cap),
             (None, requested) => requested,
         }
+    }
+
+    /// Whether an explicit byte request is one the cap cannot serve. An over-cap ask is refused
+    /// BEFORE the go-ahead: a run that starts can only end as a truncated stream, and the payload is a
+    /// raw byte stream with no frame boundary to carry a late refusal, so the client would read a
+    /// stall or count truncated bytes as measured. A request at or under the cap is untouched.
+    pub(crate) fn over_bytes(&self, requested: u64) -> bool {
+        self.max_bytes.is_some_and(|cap| requested > cap)
     }
 
     /// Whether any bound is set. False is the owner profile, which bounds nothing.
@@ -128,8 +139,11 @@ where
 }
 
 /// Answer one inbound stream on the `speed` service: run the requested transfer (sink / source /
-/// bidir), one per stream, bounded by `caps`. A ping frame is refused with [`ProtocolError::WrongService`]
-/// for symmetry, so a `speed` grant serves only throughput, never a liveness probe on the wrong wall.
+/// bidir), one per stream, bounded by `caps`. An explicit request for more bytes than the byte cap
+/// allows is refused with the typed Layer-2 frame BEFORE any payload moves: the ask itself is
+/// unserviceable, and a payload has no frame boundary that could carry a later refusal. A ping frame is
+/// refused with [`ProtocolError::WrongService`] for symmetry, so a `speed` grant serves only throughput,
+/// never a liveness probe on the wrong wall.
 ///
 /// Crate-private: the entries are [`crate::server::Speed`] (owner limits) and
 /// [`crate::server::MeteredSpeed`] (the public safety caps), which hold the transfer slot and the caps.
@@ -195,7 +209,9 @@ where
 }
 
 /// Run one speed transfer for an already-read speed request: drain a sink, source a download, or mirror a
-/// full-duplex run, each clamped to `caps` and stopped at `deadline` when one is set. Shared by
+/// full-duplex run, each clamped to `caps` and stopped at `deadline` when one is set. An ask over the
+/// byte cap is refused here, before the go-ahead (source / bidir) or the drain (sink), so the refusal is
+/// a frame the client reads exactly where it reads the transfer's own first reply. Shared by
 /// [`answer_speed`] and the union [`answer`], so the transfer engine has one home. A [`Request::Ping`] is
 /// unreachable here (both callers peel it off first) and refused for completeness.
 async fn serve_speed<W, R>(
@@ -219,6 +235,13 @@ where
             .await
         }
         Request::SpeedSink { limit_bytes } => {
+            // An exact ask over the byte cap is refused BEFORE the drain: the responder would stop
+            // reading at the cap while the client kept writing, so the refusal must land first. The
+            // `UNBOUNDED` ceiling is a time-bounded client's "no exact count", never an ask (the drain
+            // then clamps it to the cap like any unbounded run).
+            if limit_bytes != UNBOUNDED && caps.over_bytes(limit_bytes) {
+                return refuse(writer, MethodRefusal::RateLimited, SPEED_BYTE_CAP_DETAIL).await;
+            }
             // The sink drains the client's upload, clamped to the cap: a metered node never accepts more
             // than its configured bound, and the count it reports is the bytes it actually took. A
             // deadline stop is no exception: the drain returns its partial count and the reply carries
@@ -231,6 +254,12 @@ where
                 .map_err(ProtocolError::from)
         }
         Request::SpeedSource { limit_bytes } => {
+            // An ask for more bytes than the cap allows is refused BEFORE the go-ahead: a byte payload
+            // has no frame boundary to carry a later refusal, so a run that starts over the cap can only
+            // end as a truncated close the client reads as a stall or as measured bytes.
+            if limit_bytes.is_some_and(|requested| caps.over_bytes(requested)) {
+                return refuse(writer, MethodRefusal::RateLimited, SPEED_BYTE_CAP_DETAIL).await;
+            }
             // A leading go-ahead frame precedes the payload so the client can tell "here comes the
             // download" from a refusal on its first read; a wrong-method node writes `Unsupported`
             // instead (in `answer_ping`), so the download can never drain a refusal as zero bytes.
@@ -242,6 +271,10 @@ where
             Ok(())
         }
         Request::SpeedBidir { limit_bytes } => {
+            // An over-cap ask is refused before the go-ahead, exactly as the source path does.
+            if limit_bytes.is_some_and(|requested| caps.over_bytes(requested)) {
+                return refuse(writer, MethodRefusal::RateLimited, SPEED_BYTE_CAP_DETAIL).await;
+            }
             // Lead with the go-ahead frame (as the source path does) so the client's download half reads
             // "sourcing" or a refusal deterministically before any payload, then run both halves.
             Response::Sourcing.write(writer).await?;

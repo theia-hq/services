@@ -50,8 +50,10 @@ pub enum Request {
 }
 
 /// The wire value of an unbounded [`Request::SpeedSource`]. `u64::MAX` bytes is unreachable in any real
-/// transfer, so it reads unambiguously as "stream until the client stops" rather than a byte count.
-const UNBOUNDED: u64 = u64::MAX;
+/// transfer, so it reads unambiguously as "stream until the client stops" rather than a byte count. A
+/// time-bounded [`Request::SpeedSink`] writes the same value as its byte ceiling (`Limit::byte_ceiling`),
+/// so a responder reads it there as "the client named no exact count", never as an over-cap ask.
+pub(crate) const UNBOUNDED: u64 = u64::MAX;
 
 /// Wire tags for the [`Request`] variants, kept next to the frame they select.
 mod tag {
@@ -96,8 +98,9 @@ pub enum MethodRefusal {
     #[error("this service does not serve that method")]
     WrongMethod,
     /// The service serves the method but hit a responder-side bound on this run: per-caller rate
-    /// limiting, or the ping stream's byte ceiling or lifetime cap. The bounded detail names which;
-    /// the code is the coarse branch (stop the run, report the refusal).
+    /// limiting, the ping stream's byte ceiling or lifetime cap, or a speed request that asks for
+    /// more bytes than the route's cap allows. The bounded detail names which; the code is the
+    /// coarse branch (stop the run, report the refusal).
     #[error("rate limited")]
     RateLimited,
     /// The service serves the method but is busy right now (a transfer slot).

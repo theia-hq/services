@@ -36,13 +36,15 @@ async fn paired() -> Result<Paired, Error> {
 }
 
 /// Which single method a node serves: this is the Layer-2 fixture, a node that serves exactly one of the
-/// two methods so the OTHER is refused at the wire by [`answer_ping`] / [`answer_speed`].
+/// two methods so the OTHER is refused at the wire by [`answer_ping`] / [`answer_speed`]. The speed
+/// variant carries the caps its body runs under, so the metered shape and the unbounded default share
+/// the one harness.
 #[derive(Clone, Copy)]
 enum Serves {
     /// Serve only ping ([`answer_ping`]): a speed frame is refused.
     Ping,
-    /// Serve only speed ([`answer_speed`]): a ping frame is refused.
-    Speed,
+    /// Serve only speed ([`answer_speed`]) under these caps: a ping frame is refused.
+    Speed(SpeedCaps),
 }
 
 /// Bring up a responder that serves exactly ONE method (via [`answer_ping`] / [`answer_speed`], the split
@@ -62,7 +64,7 @@ async fn serving_one(serves: Serves) -> Result<Paired, Error> {
         while let Ok((writer, reader)) = session.accept_bi().await {
             let _ = match serves {
                 Serves::Ping => answer_ping(writer, reader, PingCaps::default()).await,
-                Serves::Speed => answer_speed(writer, reader, SpeedCaps::default()).await,
+                Serves::Speed(caps) => answer_speed(writer, reader, caps).await,
             };
         }
     });
@@ -259,7 +261,7 @@ async fn a_ping_frame_on_a_speed_only_node_carries_the_unsupported_refusal() {
     // The symmetric Layer-2 proof: a responder wired `answer_speed` that receives a ping frame WRITES
     // `Response::Unsupported`, and the client decodes `ProtocolError::Refused` rather than reading the
     // dropped stream as `100% loss`.
-    let (serving, session) = serving_one(Serves::Speed)
+    let (serving, session) = serving_one(Serves::Speed(SpeedCaps::default()))
         .await
         .expect("client should reach the speed-only responder");
 
@@ -282,6 +284,43 @@ async fn a_ping_frame_on_a_speed_only_node_carries_the_unsupported_refusal() {
 
     drop(session);
     serving.abort();
+}
+
+#[tokio::test]
+async fn an_over_cap_speed_run_surfaces_the_typed_refusal() {
+    // The public-cap defect this pins: a metered responder served a truncated payload with no frame, so
+    // a client asking for more than the cap waited on bytes that would never come (the live hang) or
+    // folded the short count into a plausible throughput. The over-cap ask is now refused BEFORE the
+    // payload, in every mode, and the client decodes the typed refusal and returns.
+    let caps = SpeedCaps {
+        max_bytes: Some(1024 * 1024),
+        max_duration: Some(Duration::from_secs(15)),
+    };
+    for mode in [Mode::Down, Mode::Up, Mode::Bidir] {
+        let (serving, session) = serving_one(Serves::Speed(caps))
+            .await
+            .expect("client should reach the responder");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            Speedtest::new(mode, Limit::ByBytes(4 * 1024 * 1024)).run(&session),
+        )
+        .await
+        .expect("an over-cap run must end promptly, not park");
+        assert!(
+            matches!(
+                outcome,
+                Err(ProtocolError::Refused(Refusal::Method {
+                    code: MethodRefusal::RateLimited,
+                    ..
+                }))
+            ),
+            "an over-cap {mode:?} run must surface the typed rate-limit refusal: {outcome:?}"
+        );
+
+        drop(session);
+        serving.abort();
+    }
 }
 
 #[tokio::test]

@@ -35,8 +35,9 @@ only ones the proof will open. The caller owns admission.
 - **Exposure-coupled metering, by type.** The metered engines are the only openable ones and always carry
   the caps; the owner engines are unbounded and can never be opened. That coupling is structural, not an
   assembly choice.
-- **Metered bounds are per service instance.** A metered `speed` admits one transfer at a time, clamps
-  each direction to the byte cap, and stops the stream at the wall-clock cap (a capped sink replies with
+- **Metered bounds are per service instance.** A metered `speed` admits one transfer at a time. A
+  request for more bytes than the byte cap allows is refused with the typed Layer-2 frame before any
+  payload; an unbounded run is clamped to the cap and stops at the wall clock (a capped sink replies with
   the bytes it took; a capped source closes early). An owner `speed` bounds neither and takes no slot.
 - **An owner diagnostic has no caps of its own.** The serving transport's session and stream table (256
   sessions, 256 streams per session) is the only bound, so a member admitted by the gate can drain the

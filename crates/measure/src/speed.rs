@@ -105,6 +105,11 @@ impl Speedtest {
 /// Drive the upload leg: ask the responder to sink, stream counted bytes until the bound, then read the
 /// count it confirmed receiving. Reports only confirmed bytes, so a shortfall (loss or truncation)
 /// surfaces rather than laundering into a plausible-but-smaller throughput.
+///
+/// The payload and the reply move over the two halves of the one stream, so both are live at once. That
+/// is what lets a refusal land: a responder that will not serve the ask (busy, or an ask over its byte
+/// cap) writes the typed frame BEFORE draining a byte, and a client that only read after sending would
+/// park in a stream the responder had stopped reading.
 async fn upload<W, R>(
     writer: &mut W,
     reader: &mut R,
@@ -123,13 +128,33 @@ where
     }
     .write(writer)
     .await?;
-    let sent = limit.payload(started, progress).send(writer).await?;
+    let mut reply = std::pin::pin!(Response::read(reader));
+    let sent = {
+        let send = limit.payload(started, progress).send(writer);
+        tokio::pin!(send);
+        // The reply is polled first when both halves are ready: on a refused stream the write error is
+        // incidental, and the typed frame is the outcome to report.
+        tokio::select! {
+            biased;
+            reply = &mut reply => match reply? {
+                // A node that does not serve speed, a busy slot, or an ask over the byte cap: all
+                // refused with `Unsupported` before a byte is drained. A typed `Refused`, never a
+                // plausible-but-smaller throughput.
+                Response::Unsupported { code, detail } => {
+                    return Err(ProtocolError::Refused(Refusal::Method { code, detail }));
+                }
+                // The responder closed its drain before the send returned: its count is the whole
+                // result, whether the client's bound or the responder's own ended the run.
+                Response::Received { bytes } => return Ok(bytes),
+                _ => return Err(ProtocolError::Mismatched),
+            },
+            sent = &mut send => sent?,
+        }
+    };
     // Signal end-of-payload so the responder stops draining and replies with its count.
     writer.shutdown().await?;
-    let bytes = match Response::read(reader).await? {
+    let bytes = match reply.await? {
         Response::Received { bytes } => bytes,
-        // A node that does not serve speed refuses the sink frame with `Unsupported` before draining a
-        // byte: a typed `Refused`, never a plausible-but-smaller throughput.
         Response::Unsupported { code, detail } => {
             return Err(ProtocolError::Refused(Refusal::Method { code, detail }));
         }
