@@ -18,8 +18,9 @@ use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
 
 /// The responder-side bounds [`crate::server::Speed`] enforces on one speed stream: the largest payload it
 /// will move per direction and the longest it will run. `None` on either is unbounded (the old
-/// mirror-the-client behavior), which a caller may choose only through
-/// [`crate::server::Limits::unmetered`] and then owns the banner caveat.
+/// mirror-the-client behavior), which only the crate's test-only union body asks for: the public-capable
+/// [`crate::server::Speed`] fills both caps from [`crate::server::Limits`], which has no unbounded
+/// constructor.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SpeedCaps {
     /// The largest payload one direction may move, or `None` for unbounded.
@@ -27,6 +28,25 @@ pub(crate) struct SpeedCaps {
     /// The longest the stream may run, or `None` for unbounded.
     pub(crate) max_duration: Option<Duration>,
 }
+
+/// The responder-side bounds [`crate::server::Ping`] enforces on one ping stream: the largest number of
+/// bytes the stream may move (fixed-width requests plus their echoes) and the longest it may run, from
+/// the opening read through the last echo. `None` on either is unbounded (the old mirror-the-client
+/// behavior), which only the crate's test-only union body asks for: the public-capable
+/// [`crate::server::Ping`] fills both caps from [`crate::server::Limits`], which has no unbounded
+/// constructor.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PingCaps {
+    /// The largest number of stream bytes one run may move, or `None` for unbounded.
+    pub(crate) max_bytes: Option<u64>,
+    /// The longest the stream may run, or `None` for unbounded.
+    pub(crate) max_duration: Option<Duration>,
+}
+
+/// The refusal a ping stream ends with when its byte ceiling stops it.
+const PING_BYTE_CAP_DETAIL: &str = "ping stream reached its byte cap, reconnect to continue";
+/// The refusal a ping stream ends with when its wall clock stops it.
+const PING_TIME_CAP_DETAIL: &str = "ping stream reached its lifetime cap, reconnect to continue";
 
 impl SpeedCaps {
     /// Bound a requested byte count: an explicit request is clamped to the cap, and an unbounded source
@@ -41,21 +61,48 @@ impl SpeedCaps {
 }
 
 /// Answer one inbound stream on the `ping` service: echo the opening ping and every probe on it
-/// (the client sends its whole run over one stream). A non-ping frame is a wire-level violation, not a
-/// silent widening: the outer `ping` gate admitted this stream for liveness only, so a speed frame
-/// here is refused with [`ProtocolError::WrongService`].
+/// (the client sends its whole run over one stream), bounded by `caps`. A non-ping frame is a wire-level
+/// violation, not a silent widening: the outer `ping` gate admitted this stream for liveness only, so a
+/// speed frame here is refused with [`ProtocolError::WrongService`].
+///
+/// One deadline covers the opening read and every echo, so a peer that opens a stream and stalls is
+/// bounded like the run itself; a capped stream ends with the typed Layer-2 refusal when the stream
+/// still carries a frame, and closes when the peer is no longer reading.
 ///
 /// Crate-private: the entry is [`crate::server::Ping`], which applies the per-caller rate bound first.
-pub(crate) async fn answer_ping<W, R>(mut writer: W, mut reader: R) -> Result<(), ProtocolError>
+pub(crate) async fn answer_ping<W, R>(
+    mut writer: W,
+    mut reader: R,
+    caps: PingCaps,
+) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    match Request::read(&mut reader).await? {
+    let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
+    let opening = match deadline {
+        Some(deadline) => match time::timeout_at(deadline, Request::read(&mut reader)).await {
+            Ok(request) => request?,
+            // The cap fired before a probe arrived; nothing was served, so the stream just closes.
+            Err(_past_deadline) => return Ok(()),
+        },
+        None => Request::read(&mut reader).await?,
+    };
+    match opening {
         Request::Ping {
             seq,
             sent_unix_nanos,
-        } => echo_pings(&mut writer, &mut reader, seq, sent_unix_nanos).await,
+        } => {
+            echo_pings(
+                &mut writer,
+                &mut reader,
+                seq,
+                sent_unix_nanos,
+                caps,
+                deadline,
+            )
+            .await
+        }
         _ => {
             refuse(
                 &mut writer,
@@ -118,7 +165,17 @@ where
         Request::Ping {
             seq,
             sent_unix_nanos,
-        } => echo_pings(&mut writer, &mut reader, seq, sent_unix_nanos).await,
+        } => {
+            echo_pings(
+                &mut writer,
+                &mut reader,
+                seq,
+                sent_unix_nanos,
+                PingCaps::default(),
+                None,
+            )
+            .await
+        }
         speed => serve_speed(&mut writer, &mut reader, speed, SpeedCaps::default(), None).await,
     }
 }
@@ -165,7 +222,8 @@ where
             // instead (in `answer_ping`), so the download can never drain a refusal as zero bytes.
             Response::Sourcing.write(writer).await?;
             // A cap turns an unbounded source into a byte- or time-bounded one, so a metered run always
-            // terminates on the responder's own terms; an unmetered one sources until the client stops.
+            // terminates on the responder's own terms; an unbounded one (the test-only union body)
+            // sources until the client stops.
             source(writer, caps.clamp(limit_bytes), deadline).await?;
             Ok(())
         }
@@ -243,39 +301,102 @@ async fn source<W: io::AsyncWrite + Unpin>(
     }
 }
 
-/// Echo the opening ping, then every subsequent ping on the same stream until the client closes it.
+/// End a ping stream that hit a cap: write the typed Layer-2 refusal while the stream still carries a
+/// frame, then close. Best effort under the stream deadline, because a peer that stopped reading has no
+/// room for the frame: the cap, not the write, owns the stream's end.
+async fn refuse_capped<W: io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    deadline: Option<time::Instant>,
+    detail: &str,
+) -> Result<(), ProtocolError> {
+    let frame = Response::Unsupported {
+        code: MethodRefusal::RateLimited,
+        detail: RefusalDetail::bounded(detail),
+    };
+    match deadline {
+        Some(deadline) => match time::timeout_at(deadline, frame.write(writer)).await {
+            Ok(result) => result?,
+            Err(_past_deadline) => {}
+        },
+        None => frame.write(writer).await?,
+    }
+    Ok(())
+}
+
+/// Echo the opening ping, then every subsequent ping on the same stream until the client closes it or
+/// `caps` end the run.
+///
+/// The byte ceiling counts the whole stream (each fixed-width request and its echo), and the wall clock
+/// covers the opening read through the last echo, whichever ends first. Either ending writes the typed
+/// Layer-2 refusal where the stream still carries one, so a client reads a refusal, never a silent close
+/// it folds into loss; a client that stopped reading sees only the close, because the write is best
+/// effort at the cap. The wall clock is checked between probes as well as on the pending operations: a
+/// peer that keeps every await ready would otherwise stream past the deadline without ever parking.
 async fn echo_pings<W, R>(
     writer: &mut W,
     reader: &mut R,
     mut seq: u32,
     mut sent_unix_nanos: u64,
+    caps: PingCaps,
+    deadline: Option<time::Instant>,
 ) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
+    // The opening probe was read by the caller; charge it here so the byte ceiling counts the whole
+    // stream, not just the echoes.
+    let mut moved = Request::PING_BYTES;
     loop {
-        Response::Pong {
+        if deadline.is_some_and(|deadline| time::Instant::now() >= deadline) {
+            return refuse_capped(writer, deadline, PING_TIME_CAP_DETAIL).await;
+        }
+        if caps
+            .max_bytes
+            .is_some_and(|max| moved + Response::PONG_BYTES > max)
+        {
+            return refuse_capped(writer, deadline, PING_BYTE_CAP_DETAIL).await;
+        }
+
+        let pong = Response::Pong {
             seq,
             sent_unix_nanos,
+        };
+        let echoed = match deadline {
+            Some(deadline) => time::timeout_at(deadline, pong.write(writer)).await,
+            None => Ok(pong.write(writer).await),
+        };
+        match echoed {
+            Ok(result) => result?,
+            // The echo parked on backpressure at the cap: the peer is not reading, so no frame can
+            // reach it; close instead of holding the task past the cap.
+            Err(_past_deadline) => return Ok(()),
         }
-        .write(writer)
-        .await?;
+        moved += Response::PONG_BYTES;
 
-        match Request::read(reader).await {
-            Ok(Request::Ping {
+        let next = match deadline {
+            Some(deadline) => time::timeout_at(deadline, Request::read(reader)).await,
+            None => Ok(Request::read(reader).await),
+        };
+        match next {
+            Ok(Ok(Request::Ping {
                 seq: next_seq,
                 sent_unix_nanos: next_nonce,
-            }) => {
+            })) => {
                 seq = next_seq;
                 sent_unix_nanos = next_nonce;
+                moved += Request::PING_BYTES;
             }
             // A clean EOF ends the probe run; any other outcome is a real stream error.
-            Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Ok(Err(ProtocolError::Io(error))) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 return Ok(());
             }
-            Ok(_) => return Err(ProtocolError::Mismatched),
-            Err(error) => return Err(error),
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(_)) => return Err(ProtocolError::Mismatched),
+            // An idle peer at the cap: the stream is between frames, so the refusal lands whole.
+            Err(_past_deadline) => {
+                return refuse_capped(writer, deadline, PING_TIME_CAP_DETAIL).await;
+            }
         }
     }
 }

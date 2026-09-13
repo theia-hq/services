@@ -1,19 +1,22 @@
-//! Responder-side bounds: the speed stream's wall-clock cap, proven on a paused clock so the cap fires
-//! deterministically instead of after real seconds. The bounded and partial-count paths are driven over
-//! one in-memory stream pair, the same [`answer_speed`] body the responder wires.
+//! Responder-side bounds: the ping stream's wall-clock and byte caps and the speed stream's wall-clock
+//! cap, proven on a paused clock so the caps fire deterministically instead of after real seconds. The
+//! bounded and partial-count paths are driven over one in-memory stream pair, the same [`answer_ping`] /
+//! [`answer_speed`] bodies the responder wires.
 
 use core::time::Duration;
 
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 use tokio::time;
 
-use super::{SpeedCaps, answer_speed};
-use crate::protocol::{ProtocolError, Request, Response};
+use super::{
+    PING_BYTE_CAP_DETAIL, PING_TIME_CAP_DETAIL, PingCaps, SpeedCaps, answer_ping, answer_speed,
+};
+use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
 
 /// The in-memory stream capacity. Small, so an unbounded source fills it and parks on backpressure.
 const CAPACITY: usize = 1024;
 
-/// The responder task's join handle: [`answer_speed`] driving the server halves.
+/// The responder task's join handle: the answer body driving the server halves.
 type Serving = tokio::task::JoinHandle<Result<(), ProtocolError>>;
 
 /// Caps that never end a run on bytes, so the wall clock is the only terminator under test.
@@ -24,12 +27,21 @@ fn capped_at(duration: Duration) -> SpeedCaps {
     }
 }
 
-/// An in-memory stream pair with the responder already running on the server end.
+/// An in-memory stream pair with the speed responder already running on the server end.
 fn serve(caps: SpeedCaps) -> (DuplexStream, Serving) {
     let (client, server) = io::duplex(CAPACITY);
     let (mut server_read, mut server_write) = io::split(server);
     let task =
         tokio::spawn(async move { answer_speed(&mut server_write, &mut server_read, caps).await });
+    (client, task)
+}
+
+/// An in-memory stream pair with the ping responder already running on the server end.
+fn serve_ping(caps: PingCaps) -> (DuplexStream, Serving) {
+    let (client, server) = io::duplex(CAPACITY);
+    let (mut server_read, mut server_write) = io::split(server);
+    let task =
+        tokio::spawn(async move { answer_ping(&mut server_write, &mut server_read, caps).await });
     (client, task)
 }
 
@@ -130,5 +142,104 @@ async fn a_capped_sink_reports_the_bytes_it_took() {
             "the sink reports the bytes it actually took, not zero"
         ),
         other => panic!("a capped sink must report its partial count, got {other:?}"),
+    }
+}
+
+/// A ping stream whose client goes silent after the first probe must end at the wall-clock cap, not run
+/// until the client closes or the job dies. The paused clock advances to the deadline while both ends
+/// wait, so the assertion is deterministic. The client sees the cap as a typed refusal, never a silent
+/// close it would fold into loss.
+#[tokio::test(start_paused = true)]
+async fn an_idle_ping_stream_stops_at_the_duration_cap() {
+    let cap = Duration::from_secs(60);
+    let (mut client, serving) = serve_ping(PingCaps {
+        max_bytes: None,
+        max_duration: Some(cap),
+    });
+
+    Request::Ping {
+        seq: 0,
+        sent_unix_nanos: 7,
+    }
+    .write(&mut client)
+    .await
+    .expect("the opening probe fits the stream");
+    assert_eq!(
+        Response::read(&mut client).await.expect("the opening pong"),
+        Response::Pong {
+            seq: 0,
+            sent_unix_nanos: 7
+        }
+    );
+
+    let started = time::Instant::now();
+    let result = serving.await.expect("the responder task does not panic");
+    assert!(
+        result.is_ok(),
+        "a capped ping stream closes cleanly: {result:?}"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= cap,
+        "the idle stream must hold to the cap, took {elapsed:?}"
+    );
+    assert!(
+        elapsed <= cap + Duration::from_secs(1),
+        "the cap, not the client, must end the stream, took {elapsed:?}"
+    );
+
+    match Response::read(&mut client).await.expect("the cap refusal") {
+        Response::Unsupported { code, detail } => {
+            assert_eq!(code, MethodRefusal::RateLimited);
+            assert_eq!(detail.as_str(), PING_TIME_CAP_DETAIL);
+        }
+        other => panic!("a capped stream must end with a typed refusal, got {other:?}"),
+    }
+}
+
+/// A probing client that reads every echo still cannot move more bytes than the byte cap: the stream
+/// ends with the typed refusal once the counted requests and echoes reach the ceiling, before the wall
+/// clock (paused at zero elapsed here) can fire.
+#[tokio::test(start_paused = true)]
+async fn a_busy_ping_stream_stops_at_the_byte_cap() {
+    // Room for exactly two round trips: the opening request plus its echo, then one more probe and
+    // echo; the following echo would cross the ceiling and is refused instead.
+    let round_trip = Request::PING_BYTES + Response::PONG_BYTES;
+    let (mut client, serving) = serve_ping(PingCaps {
+        max_bytes: Some(2 * round_trip),
+        max_duration: Some(Duration::from_secs(60)),
+    });
+
+    let mut pongs = 0u32;
+    let mut ending = None;
+    for seq in 0..10 {
+        Request::Ping {
+            seq,
+            sent_unix_nanos: u64::from(seq),
+        }
+        .write(&mut client)
+        .await
+        .expect("the probe fits the stream");
+        match Response::read(&mut client).await.expect("a reply frame") {
+            Response::Pong { .. } => pongs += 1,
+            other => {
+                ending = Some(other);
+                break;
+            }
+        }
+    }
+
+    let result = serving.await.expect("the responder task does not panic");
+    assert!(
+        result.is_ok(),
+        "a byte-capped ping stream closes cleanly: {result:?}"
+    );
+    assert_eq!(pongs, 2, "the cap allows exactly two echoes");
+    match ending {
+        Some(Response::Unsupported { code, detail }) => {
+            assert_eq!(code, MethodRefusal::RateLimited);
+            assert_eq!(detail.as_str(), PING_BYTE_CAP_DETAIL);
+        }
+        other => panic!("the stream must end with a typed refusal, got {other:?}"),
     }
 }

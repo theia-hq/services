@@ -7,7 +7,7 @@ use core::time::Duration;
 use bifrost::{Error, NoDiscovery, Node, Session as _};
 use bifrost_mem::MemTransport;
 
-use crate::responder::{SpeedCaps, answer, answer_ping, answer_speed};
+use crate::responder::{PingCaps, SpeedCaps, answer, answer_ping, answer_speed};
 use crate::{Limit, MethodRefusal, Mode, Ping, ProtocolError, Refusal, Speedtest};
 
 /// A responder node serving in the background, and a live client session to it, over one mem process.
@@ -60,7 +60,7 @@ async fn serving_one(serves: Serves) -> Result<Paired, Error> {
         // refused at the wire. One at a time is enough for these fixtures (one dial per test).
         while let Ok((writer, reader)) = session.accept_bi().await {
             let _ = match serves {
-                Serves::Ping => answer_ping(writer, reader).await,
+                Serves::Ping => answer_ping(writer, reader, PingCaps::default()).await,
                 Serves::Speed => answer_speed(writer, reader, SpeedCaps::default()).await,
             };
         }

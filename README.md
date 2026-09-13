@@ -55,9 +55,10 @@ pinning a rev is available if you want a fixed point; that choice is the embedde
 ## Honest limits
 
 - **The engines ship the ceiling, the root ships the assembly.** Each engine's handler declares its
-  exposure (`Never`, or `OptIn` where an operator may open it deliberately) and its metering. Admission,
-  the open decision, transport, and identity stay in the embedding program. This repo ships no gate, no
-  registry, and no binary. Each engine README carries that engine's limits.
+  exposure (`Never`, or `OptIn` where an operator may open it deliberately) and its metering. The
+  public-capable diagnostics (ping, speed) are metered by construction, so no assembly can drop their
+  caps. Admission, the open decision, transport, and identity stay in the embedding program. This repo
+  ships no gate, no registry, and no binary. Each engine README carries that engine's limits.
 - **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The APIs change
   without notice.
 - **One repo, one rev.** All four engines share a rev; a bump for one moves the pin for the others. A
