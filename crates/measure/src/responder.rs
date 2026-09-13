@@ -1,47 +1,36 @@
-//! The diagnostic responder: what every "online" node runs to answer reach diagnostics. It serves an
-//! accepted [`Session`]'s streams, dispatching each on its opening [`Request`]: echo a ping, drain a
-//! sink, source a stream. Generic over `Session`, so the same responder answers over iroh (behind a served
-//! node) and over mem (in tests).
+//! The diagnostic responder bodies: what an admitted diagnostic stream does, one method at a time.
 //!
 //! ping and speed are TWO independent services, not one: `ping` (cheap RTT) and `speed` (bandwidth-eating
 //! throughput). A node may offer one without the other, and each carries its own gate, so the served
-//! method MUST match the service that admitted the stream. [`answer_ping`] and [`answer_speed`] are the
-//! two narrow entry points the composing consumer wires into the handler registry: each refuses the other's method at the wire
-//! ([`ProtocolError::WrongService`]), so a `ping` grant can never open a speed drain even
-//! though both speak the same frame. [`answer`] is the union of both, for a responder that serves
-//! both over one session.
+//! method MUST match the service that admitted the stream. [`crate::server::Ping`] and
+//! [`crate::server::Speed`] are the public entries; the per-stream bodies here are crate-private and each
+//! refuses the other's method at the wire ([`ProtocolError::WrongService`]), so a `ping` grant can never
+//! open a speed drain even though both speak the same frame. `answer` is the union of both, for the
+//! in-crate responder loop the reach tests drive.
 
-use bifrost::{RefusalDetail, Session};
-use futures::StreamExt as _;
-use futures::stream::FuturesUnordered;
+use bifrost::RefusalDetail;
 use tokio::io;
 
 use crate::payload::Payload;
 use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
 
-/// Answers the diagnostic services on one session's streams.
-pub struct Responder;
+/// The responder-side bounds [`crate::server::Speed`] enforces on one speed stream: the largest payload it
+/// will move per direction. `None` is unbounded (the old mirror-the-client behavior), which a caller may
+/// choose only through [`crate::server::Limits::unmetered`] and then owns the banner caveat.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SpeedCaps {
+    /// The largest payload one direction may move, or `None` for unbounded.
+    pub(crate) max_bytes: Option<u64>,
+}
 
-impl Responder {
-    /// Serve a session until the peer goes away: handle each inbound stream concurrently, and keep the
-    /// session alive when one stream fails so a single bad probe never drops the others.
-    pub async fn serve<S: Session>(session: S) {
-        let mut streams = FuturesUnordered::new();
-        loop {
-            tokio::select! {
-                accepted = session.accept_bi() => {
-                    let Ok((writer, reader)) = accepted else {
-                        // The peer closed the session (or the transport failed): stop serving it.
-                        return;
-                    };
-                    streams.push(answer(writer, reader));
-                }
-                Some(result) = streams.next(), if !streams.is_empty() => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "diagnostic stream ended");
-                    }
-                }
-            }
+impl SpeedCaps {
+    /// Bound a requested byte count: an explicit request is clamped to the cap, and an unbounded source
+    /// (`None`) becomes the cap itself, so a metered run always terminates on a byte count.
+    pub(crate) fn clamp(&self, limit_bytes: Option<u64>) -> Option<u64> {
+        match (self.max_bytes, limit_bytes) {
+            (Some(cap), Some(requested)) => Some(requested.min(cap)),
+            (Some(cap), None) => Some(cap),
+            (None, requested) => requested,
         }
     }
 }
@@ -51,18 +40,8 @@ impl Responder {
 /// silent widening: the outer `ping` gate admitted this stream for liveness only, so a speed frame
 /// here is refused with [`ProtocolError::WrongService`].
 ///
-/// The caller owns admission. Once a session is admitted, this is the whole server side:
-///
-/// ```
-/// use measure::answer_ping;
-///
-/// async fn serve<S: bifrost::Session>(session: S) {
-///     while let Ok((writer, reader)) = session.accept_bi().await {
-///         let _ = answer_ping(writer, reader).await;
-///     }
-/// }
-/// ```
-pub async fn answer_ping<W, R>(mut writer: W, mut reader: R) -> Result<(), ProtocolError>
+/// Crate-private: the entry is [`crate::server::Ping`], which applies the per-caller rate bound first.
+pub(crate) async fn answer_ping<W, R>(mut writer: W, mut reader: R) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
@@ -72,28 +51,49 @@ where
             seq,
             sent_unix_nanos,
         } => echo_pings(&mut writer, &mut reader, seq, sent_unix_nanos).await,
-        _ => refuse(&mut writer, "this node serves ping, not speed").await,
+        _ => {
+            refuse(
+                &mut writer,
+                MethodRefusal::WrongMethod,
+                "this node serves ping, not speed",
+            )
+            .await
+        }
     }
 }
 
 /// Answer one inbound stream on the `speed` service: run the requested transfer (sink / source /
-/// bidir), one per stream. A ping frame is refused with [`ProtocolError::WrongService`] for symmetry, so
-/// a `speed` grant serves only throughput, never a liveness probe on the wrong wall.
-pub async fn answer_speed<W, R>(mut writer: W, mut reader: R) -> Result<(), ProtocolError>
+/// bidir), one per stream, bounded by `caps`. A ping frame is refused with [`ProtocolError::WrongService`]
+/// for symmetry, so a `speed` grant serves only throughput, never a liveness probe on the wrong wall.
+///
+/// Crate-private: the entry is [`crate::server::Speed`], which holds the transfer slot and the caps.
+pub(crate) async fn answer_speed<W, R>(
+    mut writer: W,
+    mut reader: R,
+    caps: SpeedCaps,
+) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
     match Request::read(&mut reader).await? {
-        Request::Ping { .. } => refuse(&mut writer, "this node serves speed, not ping").await,
-        speed => serve_speed(&mut writer, &mut reader, speed).await,
+        Request::Ping { .. } => {
+            refuse(
+                &mut writer,
+                MethodRefusal::WrongMethod,
+                "this node serves speed, not ping",
+            )
+            .await
+        }
+        speed => serve_speed(&mut writer, &mut reader, speed, caps).await,
     }
 }
 
 /// Answer one inbound stream on the union of both methods, dispatching on its opening
-/// request. Used by [`Responder`], which serves ping and speed over one session; the split
-/// [`answer_ping`]/[`answer_speed`] are what the gated registry wires when the two are distinct services.
-pub async fn answer<W, R>(mut writer: W, mut reader: R) -> Result<(), ProtocolError>
+/// request. The in-crate responder loop the reach tests drive uses this; a served node wires the split
+/// [`crate::server::Ping`] / [`crate::server::Speed`] entries instead, each behind its own gate.
+#[cfg(test)]
+pub(crate) async fn answer<W, R>(mut writer: W, mut reader: R) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
@@ -103,27 +103,38 @@ where
             seq,
             sent_unix_nanos,
         } => echo_pings(&mut writer, &mut reader, seq, sent_unix_nanos).await,
-        speed => serve_speed(&mut writer, &mut reader, speed).await,
+        speed => serve_speed(&mut writer, &mut reader, speed, SpeedCaps::default()).await,
     }
 }
 
 /// Run one speed transfer for an already-read speed request: drain a sink, source a download, or mirror a
-/// full-duplex run. Shared by [`answer_speed`] and the union [`answer`], so the transfer engine has
-/// one home. A [`Request::Ping`] is unreachable here (both callers peel it off first) and refused for
-/// completeness.
+/// full-duplex run, each clamped to `caps`. Shared by [`answer_speed`] and the union [`answer`], so the
+/// transfer engine has one home. A [`Request::Ping`] is unreachable here (both callers peel it off first)
+/// and refused for completeness.
 async fn serve_speed<W, R>(
     writer: &mut W,
     reader: &mut R,
     request: Request,
+    caps: SpeedCaps,
 ) -> Result<(), ProtocolError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
     match request {
-        Request::Ping { .. } => refuse(writer, "this node serves speed, not ping").await,
+        Request::Ping { .. } => {
+            refuse(
+                writer,
+                MethodRefusal::WrongMethod,
+                "this node serves speed, not ping",
+            )
+            .await
+        }
         Request::SpeedSink { limit_bytes } => {
-            let bytes = Payload::of(limit_bytes).drain(reader).await?;
+            // The sink drains the client's upload, clamped to the cap: a metered node never accepts more
+            // than its configured bound, and the count it reports is the bytes it actually took.
+            let bounded = caps.clamp(Some(limit_bytes)).unwrap_or(limit_bytes);
+            let bytes = Payload::of(bounded).drain(reader).await?;
             Response::Received { bytes }
                 .write(writer)
                 .await
@@ -134,23 +145,21 @@ where
             // download" from a refusal on its first read; a wrong-method node writes `Unsupported`
             // instead (in `answer_ping`), so the download can never drain a refusal as zero bytes.
             Response::Sourcing.write(writer).await?;
-            // A byte-bounded download sources an exact count; a time-bounded one sources until the
-            // client stops reading at its deadline, so the client's wall clock is the sole terminator.
-            source(writer, limit_bytes).await?;
+            // A cap turns an unbounded source into a byte-bounded one, so a metered run always terminates
+            // on the responder's own terms; an unmetered one sources until the client stops.
+            source(writer, caps.clamp(limit_bytes)).await?;
             Ok(())
         }
         Request::SpeedBidir { limit_bytes } => {
             // Lead with the go-ahead frame (as the source path does) so the client's download half reads
             // "sourcing" or a refusal deterministically before any payload, then run both halves.
             Response::Sourcing.write(writer).await?;
-            // Full-duplex: drain the client's upload to EOF while sourcing our download at once, so both
-            // halves of the one stream carry counted payload simultaneously. The responder holds no
-            // bound of its own; it mirrors the client. A byte bound sources an exact count and the
-            // client's FIN ends the drain; a time bound sources until the client closes its read half at
-            // its deadline (a broken pipe) and FINs its write half (an EOF here). Run both to completion.
+            // Full-duplex: drain the client's upload while sourcing our download at once, both clamped to
+            // the same cap. Run both to completion.
+            let bounded = caps.clamp(limit_bytes);
             let (sourced, drained) = tokio::join!(
-                source(writer, limit_bytes),
-                Payload::of_or_until_peer(limit_bytes).drain(reader),
+                source(writer, bounded),
+                Payload::of_or_until_peer(bounded).drain(reader),
             );
             sourced?;
             drained?;
@@ -159,17 +168,18 @@ where
     }
 }
 
-/// Refuse a wrong-method frame LOUDLY: write a typed [`Response::Unsupported`] frame carrying the typed
-/// [`MethodRefusal::WrongMethod`] code and a bounded detail off `reason`, so the client decodes a refusal
-/// (not a silently dropped stream it would read as loss or zero bytes), then return
-/// [`ProtocolError::WrongService`] so the stream task logs why it refused. This is the fix for the
-/// false-success class: a wrong method is a frame on the wire, never a silent close.
-async fn refuse<W: io::AsyncWrite + Unpin>(
+/// Refuse a wrong-method or over-limit frame LOUDLY: write a typed [`Response::Unsupported`] frame carrying
+/// `code` and a bounded detail off `reason`, so the client decodes a refusal (not a silently dropped stream
+/// it would read as loss or zero bytes), then return [`ProtocolError::WrongService`] so the stream task logs
+/// why it refused. This is the fix for the false-success class: a refused frame is a frame on the wire,
+/// never a silent close.
+pub(crate) async fn refuse<W: io::AsyncWrite + Unpin>(
     writer: &mut W,
+    code: MethodRefusal,
     reason: &str,
 ) -> Result<(), ProtocolError> {
     Response::Unsupported {
-        code: MethodRefusal::WrongMethod,
+        code,
         detail: RefusalDetail::bounded(reason),
     }
     .write(writer)

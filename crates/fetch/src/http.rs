@@ -3,7 +3,8 @@
 //! It rides INSIDE an admitted stream: after the host admits the requester, the requester writes a
 //! [`FetchRequest`], the host performs the origin request and writes a [`FetchResponse`], then streams the
 //! body until the stream closes (EOF delimits the body, as the raw splice already relies on). Pure framing
-//! here; the origin fetch lives in [`serve`](crate::serve_fetch). Both ends of one fetch are one release,
+//! here; the origin fetch lives in the crate-private `serve` body, behind the [`Fetch`](crate::Fetch) and
+//! [`ScopedFetch`](crate::ScopedFetch) entries. Both ends of one fetch are one release,
 //! so the magic prefix rejects a foreign or mismatched-version stream outright.
 
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};

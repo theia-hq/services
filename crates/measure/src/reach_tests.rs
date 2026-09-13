@@ -6,10 +6,9 @@ use core::time::Duration;
 
 use bifrost::{Error, NoDiscovery, Node, Session as _};
 use bifrost_mem::MemTransport;
-use measure::{
-    Limit, MethodRefusal, Mode, Ping, ProtocolError, Refusal, Responder, Speedtest, answer_ping,
-    answer_speed,
-};
+
+use crate::responder::{SpeedCaps, answer, answer_ping, answer_speed};
+use crate::{Limit, MethodRefusal, Mode, Ping, ProtocolError, Refusal, Speedtest};
 
 /// A responder node serving in the background, and a live client session to it, over one mem process.
 type Paired = (tokio::task::JoinHandle<()>, bifrost_mem::MemSession);
@@ -21,8 +20,13 @@ async fn paired() -> Result<Paired, Error> {
     let client = Node::new(MemTransport::bind(), NoDiscovery);
 
     let serving = tokio::spawn(async move {
-        if let Ok(session) = responder.accept().await {
-            Responder::serve(session).await;
+        let Ok(session) = responder.accept().await else {
+            return;
+        };
+        // The union body (crate-private): these fixtures exercise the protocol itself, while a served node
+        // wires the split `server::Ping` / `server::Speed` entries behind their gates.
+        while let Ok((writer, reader)) = session.accept_bi().await {
+            let _ = answer(writer, reader).await;
         }
     });
 
@@ -57,7 +61,7 @@ async fn serving_one(serves: Serves) -> Result<Paired, Error> {
         while let Ok((writer, reader)) = session.accept_bi().await {
             let _ = match serves {
                 Serves::Ping => answer_ping(writer, reader).await,
-                Serves::Speed => answer_speed(writer, reader).await,
+                Serves::Speed => answer_speed(writer, reader, SpeedCaps::default()).await,
             };
         }
     });

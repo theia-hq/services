@@ -18,14 +18,16 @@ use crate::origin::OriginAllowlist;
 const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Read one [`FetchRequest`], fetch the origin, write the [`FetchResponse`] + body, then close the write
-/// half so the requester sees the body's end. The handler the composing consumer injects into the tunnel's
-/// handler registry calls this with the admitted stream's halves.
+/// half so the requester sees the body's end.
 ///
 /// `allow` is the operator's origin scope for this service, set at expose time: if it
 /// is non-empty and the request's origin is not in it, the fetch is refused with a typed
 /// [`FetchResponse::Error`] BEFORE any connection, IN FRONT of the SSRF guard, not instead of it. An empty
 /// allowlist is unconstrained (an unscoped service), so today's any-public-origin behavior is unchanged.
-pub async fn serve_fetch<W, R>(
+///
+/// Crate-private: the entries are [`Fetch`](crate::Fetch) / [`ScopedFetch`](crate::ScopedFetch), the only
+/// public doors, and the ceiling each declares is the posture check.
+pub(crate) async fn serve_fetch<W, R>(
     writer: &mut W,
     reader: &mut R,
     allow: &OriginAllowlist,

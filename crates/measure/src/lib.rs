@@ -7,18 +7,22 @@
 //! the payoff: speed is iperf, but over any transport, a built-in transport dyno.
 //!
 //! ping and speed are TWO independent services, so a node may advertise one without the other: `ping`
-//! (cheap RTT) and `speed` (bandwidth-eating throughput). A node answers them with [`answer_ping`]/[`answer_speed`]
-//! (each refuses the other's method at the wire), or serves both over one session with a [`Responder`].
-//! A client constructs a [`Ping`] or [`Speedtest`], runs it against a session, and reads back a report.
+//! (cheap RTT) and `speed` (bandwidth-eating throughput). The served entries are [`server::Ping`] and
+//! [`server::Speed`], each behind its own gate and each refusing the other's method at the wire. A client
+//! constructs a [`Ping`] or [`Speedtest`], runs it against a session, and reads back a report.
 
 pub mod ping;
 pub mod protocol;
-pub mod responder;
+pub mod server;
 pub mod speed;
 
 mod payload;
+mod responder;
+
+#[cfg(test)]
+#[path = "reach_tests.rs"]
+mod reach_tests;
 
 pub use ping::{Ping, PingReport, Probe};
 pub use protocol::{MethodRefusal, ProtocolError, Refusal};
-pub use responder::{Responder, answer, answer_ping, answer_speed};
 pub use speed::{Limit, Mode, Progress, SpeedReport, Speedtest, Throughput};

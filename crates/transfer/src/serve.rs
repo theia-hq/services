@@ -12,13 +12,12 @@ use tokio::io::{self, AsyncWriteExt as _};
 /// the safe relative path the sender named. On any failure the temp file is removed, so a rejected or
 /// truncated transfer never leaves a partial file behind.
 ///
-/// The handler the composing consumer injects into the tunnel's handler registry calls this with one
-/// admitted stream's halves and the node's configured output directory; the exposer hands each of the sender's per-file
-/// streams here concurrently, so a directory's files are received in parallel.
-///
 /// `tag` distinguishes concurrent temp files on one node (the caller passes a per-stream value), so two
 /// files arriving at once never contend for the same temp path.
-pub async fn receive_file<W, R>(
+///
+/// Crate-private: the entry is the [`Recv`](crate::Recv) handler, the only public door, and the `Never`
+/// ceiling it declares is the posture check.
+pub(crate) async fn receive_file<W, R>(
     writer: W,
     reader: R,
     out: &Path,

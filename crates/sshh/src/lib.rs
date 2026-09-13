@@ -10,9 +10,11 @@
 //! This lives in its own crate, apart from the byte-moving layer, so its heavy, security-sensitive
 //! dependency tree (`russh`, `ssh-key`, `pty-process`) stays out of a lean, reach-only client.
 //!
-//! SAFETY: a shell has no auth of its own, so the caller MUST only ever hand [`serve`] a stream that a real
-//! gate already admitted (never a raw socket, never an `open` gate). As a second line of defence, [`serve`]
-//! refuses to run as root, since a cap-holder would otherwise get a root shell.
+//! SAFETY: a shell has no auth of its own, so [`serve`] must only ever receive a stream a real gate already
+//! admitted (never a raw socket, never an `open` gate). [`Sshd`] is the entry and narrows the gate proof to
+//! a rooted witness first, so an open witness cannot even name the body; the body itself takes the rooted
+//! proof by type. As a second line of defence, it refuses
+//! to run as root, since a cap-holder would otherwise get a root shell.
 //!
 //! NOT YET (tracked follow-ups from the Tailscale-parity study): SFTP/scp, and per-user mapping (today
 //! the shell runs as this process's uid).
@@ -24,6 +26,9 @@ use russh::server::{Handler, Msg, Session};
 use russh::{Channel, ChannelId};
 use tokio::io::{self, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::watch;
+
+mod handler;
+pub use handler::Sshd;
 
 /// The maximum number of concurrent shells this process serves across ALL connections. A shell has no
 /// login of its own, so an admitted peer (or a leaked slip) could otherwise open unbounded channels and
@@ -87,19 +92,19 @@ pub fn host_seed(secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("theia sshh host key v1", secret)
 }
 
-/// Run one SSH connection over an already-authenticated, cap-gated stream: accept `none` auth and serve a
-/// pty shell. Returns when the client disconnects or the shell exits.
+/// Run one SSH connection over a stream whose gate the [`Sshd`] handler already narrowed to a ROOTED
+/// admission: accept `none` auth and serve a pty shell. Returns when the client disconnects or the shell
+/// exits.
 ///
-/// CONSUMES a [`nauthy::Admitted`] witness by value: a keyless shell accepting `none` auth is safe ONLY
-/// behind a gate, so requiring the gate's un-forgeable proof makes "authorize before serve" a compile-time
-/// precondition, not a caller's discipline. Taking it by value (and `Admitted` being neither `Copy` nor
-/// `Clone`) makes the witness single-use: one admit authorizes exactly one `serve`, so a caller cannot
-/// replay one witness onto a second stream. The witness is not otherwise inspected.
+/// CONSUMES a [`RootedAdmitted`](tightbeam_handler::RootedAdmitted) witness: a keyless shell accepting
+/// `none` auth is safe ONLY behind a gate, so requiring the gate's un-forgeable proof makes "authorize
+/// before serve" a compile-time precondition, not a caller's discipline. The handler is the only entry and
+/// narrows the gate proof first, so an open witness cannot even name this body.
 ///
 /// Refuses to run as root by construction: a shell served to a cap-holder runs as this process's user, so
 /// running privileged would hand every cap-holder a root shell. Run the server unprivileged.
-pub async fn serve<W, R>(
-    _admitted: nauthy::Admitted,
+pub(crate) async fn serve<W, R>(
+    _rooted: tightbeam_handler::RootedAdmitted,
     host_seed: [u8; 32],
     writer: W,
     reader: R,

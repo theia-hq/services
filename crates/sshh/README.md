@@ -2,20 +2,22 @@
 
 A keyless SSH server over an already-authenticated byte stream.
 
-`serve` runs one SSH connection on a stream that was already admitted: it accepts the SSH `none` auth
-method and goes straight to a shell, because the stream's admission is the authentication. The host key is
-derived from the node's own identity, so a client's `known_hosts` pins the machine across connections.
+`Sshd` serves one SSH connection on a stream a dispatcher already admitted: it accepts the SSH `none`
+auth method and goes straight to a shell, because the stream's admission is the authentication. The host
+key is derived from the node's own identity, so a client's `known_hosts` pins the machine across
+connections.
 
 ## Authorize before serve
 
-`serve` consumes a `nauthy::Admitted` witness by value, and `Admitted` has no public constructor, so
-"authorize before serve" is a compile-time precondition, not a check the caller remembers to write. The
-witness is single-use: one admission authorizes exactly one connection.
+The entry is the `Handler` impl, whose ceiling is `Never`: the serving proof is minted only from a rooted
+admission, and the impl narrows it with `Served::into_rooted` before the body runs. The body takes the
+rooted proof, so "authorize before serve" is a compile-time precondition, not a check the caller remembers
+to write, and one admission authorizes exactly one connection.
 
 ## What it refuses
 
 - **Root.** A shell served to an admitted peer runs as this process's user, so a privileged process would
-  hand out a root shell. `serve` returns `ServeError::Root` instead.
+  hand out a root shell. The body returns `ServeError::Root` instead.
 - **More than 64 live shells per process.** Past the cap, a new shell request is refused, so an admitted
   peer cannot fork-bomb the host.
 - **A revoked capability, at connect.** Revocation plus a short capability lifetime is the recall story;
@@ -23,8 +25,9 @@ witness is single-use: one admission authorizes exactly one connection.
 
 ## The entry point
 
-`serve(admitted, host_seed, writer, reader)` is the whole engine. The caller owns admission and exposure,
-and derives the host-key seed from the node identity with the exported `host_seed(&secret)`.
+`Sshd::new(host_seed)` is the whole engine: a `Handler` impl the dispatcher binds to the `sshd:` route. The
+protocol body is crate-private. The caller owns admission and exposure, and derives the host-key seed from
+the node identity with the exported `host_seed(&secret)`.
 
 It is its own crate so the heavy, security-sensitive dependency tree (`russh`, `ssh-key`, `pty-process`)
 stays out of programs that do not serve a shell.
@@ -39,7 +42,7 @@ stays out of programs that do not serve a shell.
   and the newer SFTP-based `scp` do not.
 - **Unix only.** The pty layer is `rustix`'s Unix pty API, and the root check reads the process's Unix user
   ids.
-- **Dropping the `serve` future does not abort a live shell.** The SSH session runs on a detached task, so
+- **Dropping the serving future does not abort a live shell.** The SSH session runs on a detached task, so
   the shell runs until the client disconnects or exits. The live-shell cap bounds how many run at once.
 - **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
   without notice.
