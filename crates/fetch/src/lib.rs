@@ -12,6 +12,12 @@
 //! delegate's egress. The unscoped handler carries an EMPTY allowlist, which is unconstrained: it fetches any
 //! origin that passes the SSRF guard.
 //!
+//! **Responder-side bounds.** The scoped handler enforces them by construction: one response body is
+//! capped at 16 MiB and the whole origin operation at 30 seconds, and no public constructor drops the
+//! caps, so a public route cannot bind an unbounded scoped fetch. The guard is a property of the engine
+//! type, not an assembly's choice. The unscoped handler is member-only and streams the origin to its own
+//! end.
+//!
 //! It is a service crate: it knows what to DO with an admitted stream, never how the peer was reached or
 //! gated. The composing consumer binds [`Fetch`](crate::Fetch) (unconstrained, never public) or
 //! [`ScopedFetch`](crate::ScopedFetch) (an operator allowlist, opt-in public) into its route table; the

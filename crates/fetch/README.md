@@ -28,9 +28,11 @@ host.
 Two `Handler` impls, two ceilings:
 
 - `Fetch` is unscoped: an empty allowlist fetches any public origin, so its ceiling is `Never` (an open
-  fetch would be an egress relay).
+  fetch would be an egress relay). It is member-only, so it carries no responder-side bounds.
 - `ScopedFetch::new(allow)` takes a non-empty `OriginAllowlist` and its ceiling is `OptIn`: a bounded scope
-  is a use an operator may open deliberately. An empty allowlist is refused at construction.
+  is a use an operator may open deliberately. An empty allowlist is refused at construction. The scoped
+  engine carries its bounds by construction: a 16 MiB response-body cap and a 30-second total timeout on
+  the whole origin operation, with no constructor that drops them. It reports `Metered`.
 
 The protocol body is crate-private. The caller owns admission and exposure. The `http` module publishes the
 request and response framing, so the caller's client side speaks the same wire.
@@ -39,10 +41,13 @@ request and response framing, so the caller's client side speaks the same wire.
 
 - **`GET` and `HEAD` only.** Other methods are refused. Redirects are forwarded to the requester, not
   followed here: the caller decides whether to follow.
-- **No byte cap on the response body.** An admitted requester can pull as much as the origin serves,
-  bounded only by the caller's stream and session caps.
-- **The unscoped `Fetch` is unconstrained.** The SSRF guard still holds, so only public origins pass, but
-  any public origin does; the `Never` ceiling keeps it out of an open gate.
+- **A scoped fetch stops at the caps.** The body stops at 16 MiB: the requester sees a truncated body
+  after a valid `Ok` header, and the node logs the truncation. The whole origin operation (connect,
+  response head, body) shares one 30-second deadline: an elapsed deadline after the header closes the body
+  early, and one before it answers a typed `Error`. The caps are unconditional on the scoped engine.
+- **The unscoped `Fetch` is unconstrained and unmetered.** The SSRF guard still holds, so only public
+  origins pass, but any public origin does, for as long as the origin streams; the `Never` ceiling keeps it
+  out of an open gate.
 - **The allowlist gates the origin only.** The path and query are the requester's to choose.
 - **TLS terminates at the node.** The node handles the request and response in plaintext; the requester
   trusts the node, not the origin certificate.
