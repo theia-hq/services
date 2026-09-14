@@ -4,6 +4,7 @@
 //! [`Payload`], which owns the one chunk loop and the one reusable buffer the whole engine shares.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -63,6 +64,10 @@ pub enum Bound {
 pub struct Payload {
     bound: Bound,
     progress: Option<Progress>,
+    /// The longest one payload await may park before the transfer stops, or `None` when the caller
+    /// has no stall policy (the responder side). Measured per await, so a slow but progressing
+    /// transfer is never cut; only an await that never completes ends.
+    stall: Option<Duration>,
 }
 
 impl Payload {
@@ -97,28 +102,48 @@ impl Payload {
         self
     }
 
+    /// Stop the transfer when one await on the peer parks for `stall`, returning the bytes moved so
+    /// far. The bound is per await, not for the whole transfer, so a slow link that keeps delivering
+    /// chunks is never cut; only a peer that has stopped ends the run. The caller decides whether a
+    /// short stop is an error (a byte-bounded client turns it into one).
+    pub fn stalling(mut self, stall: Duration) -> Self {
+        self.stall = Some(stall);
+        self
+    }
+
     /// Write zero payload until the bound, returning how many bytes were written. A [`Bound::Peer`]
     /// transfer ends when the peer closes its read half (a broken-pipe write error), which is the
     /// success path for an unbounded source, so it is not surfaced as an error.
     pub async fn send<W: io::AsyncWrite + Unpin>(self, writer: &mut W) -> io::Result<u64> {
-        let Self { bound, progress } = self;
+        let Self {
+            bound,
+            progress,
+            stall,
+        } = self;
         let zeros = [0u8; CHUNK as usize];
         let mut sent = 0u64;
         while let Some(want) = bound.remaining(sent) {
             let n = want.min(CHUNK) as usize;
-            // A time-bounded send must not block PAST its deadline. When the peer reads slowly (or not at
-            // all), the send window fills and `write_all` parks on backpressure; the between-chunk deadline
-            // check in `remaining` never runs, so the run overshoots its `-t` window arbitrarily and the
-            // reported rate collapses toward zero (the observed `--up`/`--bidir` hang). Race each write
-            // against the deadline and stop the instant it fires: the payload is meaningless zeros, so a
-            // torn final chunk on a stream that is about to be shut down costs nothing.
+            // A time-bounded send must not block PAST its deadline, and a byte-bounded send must not
+            // park on a peer that has stopped reading. When the peer reads slowly (or not at all),
+            // the send window fills and `write_all` parks on backpressure; the between-chunk deadline
+            // check in `remaining` never runs, so the run overshoots its `-t` window arbitrarily and
+            // the reported rate collapses toward zero (the observed `--up`/`--bidir` hang). Race each
+            // write against the bound and stop the instant it fires: the payload is meaningless zeros,
+            // so a torn final chunk on a stream that is about to be shut down costs nothing.
             let write = writer.write_all(&zeros[..n]);
-            let outcome = match bound {
-                Bound::Until(deadline) => match time::timeout_at(deadline.into(), write).await {
+            let outcome = match (bound, stall) {
+                (Bound::Until(deadline), _) => {
+                    match time::timeout_at(deadline.into(), write).await {
+                        Ok(result) => result,
+                        Err(_past_deadline) => break,
+                    }
+                }
+                (_, Some(stall)) => match time::timeout(stall, write).await {
                     Ok(result) => result,
-                    Err(_past_deadline) => break,
+                    Err(_stalled) => break,
                 },
-                _ => write.await,
+                (_, None) => write.await,
             };
             if let Err(error) = outcome {
                 return match bound {
@@ -139,25 +164,36 @@ impl Payload {
         self.drain_within(reader, None).await
     }
 
-    /// Drain payload until the bound, EOF, or `deadline`, whichever ends first, returning how many
-    /// bytes arrived. A deadline stop keeps the count taken so far: the loop owns the partial count, so
-    /// a capped responder reports the bytes it moved instead of losing them to a cancelled future.
+    /// Drain payload until the bound, EOF, `deadline`, or a stall, whichever ends first, returning
+    /// how many bytes arrived. A deadline stop keeps the count taken so far: the loop owns the
+    /// partial count, so a capped responder reports the bytes it moved instead of losing them to a
+    /// cancelled future. A stall stop does the same: the caller sees a short stream it can name.
     pub async fn drain_within<R: io::AsyncRead + Unpin>(
         self,
         reader: &mut R,
         deadline: Option<time::Instant>,
     ) -> io::Result<u64> {
-        let Self { bound, progress } = self;
+        let Self {
+            bound,
+            progress,
+            stall,
+        } = self;
         let mut sink = [0u8; CHUNK as usize];
         let mut received = 0u64;
         while let Some(want) = bound.remaining(received) {
             let read = reader.read(&mut sink[..want.min(CHUNK) as usize]);
-            let n = match deadline {
-                Some(deadline) => match time::timeout_at(deadline, read).await {
+            let n = match (deadline, stall) {
+                (Some(deadline), _) => match time::timeout_at(deadline, read).await {
                     Ok(result) => result?,
                     Err(_past_deadline) => break,
                 },
-                None => read.await?,
+                // A stalled peer parks the read; the bound ends the loop with the bytes that did
+                // arrive, so the caller sees a short stream rather than a hang.
+                (None, Some(stall)) => match time::timeout(stall, read).await {
+                    Ok(result) => result?,
+                    Err(_stalled) => break,
+                },
+                (None, None) => read.await?,
             };
             if n == 0 {
                 break;
@@ -174,6 +210,7 @@ impl From<Bound> for Payload {
         Self {
             bound,
             progress: None,
+            stall: None,
         }
     }
 }

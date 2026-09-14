@@ -376,6 +376,19 @@ pub enum ProtocolError {
     /// [`Io`]: Self::Io
     #[error("refused: {0}")]
     Refused(Refusal),
+    /// A byte-bounded run ended before the asked count with no refusal frame: the peer stopped
+    /// sending (or taking) payload, whether from its own lifetime cap, a crash, or a stalled link.
+    /// The client cannot tell those apart, so it names only that the stream ended early; `moved` is
+    /// what it could account for. Distinct from [`Refused`](Self::Refused) (a typed refusal on the
+    /// wire) and from [`Io`](Self::Io) (a stream failure): this is a measurement that stopped short,
+    /// so it must surface as an error, never as a smaller throughput or a zero-rate report.
+    #[error("stream ended early: {moved} of {asked} bytes moved")]
+    EndedEarly {
+        /// The payload bytes the client accounted for before the peer stopped.
+        moved: u64,
+        /// The byte count the client asked to move.
+        asked: u64,
+    },
     /// A refusal detail could not be trusted: the frame claimed a length over [`RefusalDetail::MAX_LEN`],
     /// or its bytes were not valid UTF-8. A corrupt or hostile stream, not a real refusal, so it is
     /// rejected rather than repaired.

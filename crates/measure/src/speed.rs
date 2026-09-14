@@ -13,6 +13,19 @@ use tokio::io::AsyncWriteExt as _;
 use crate::payload::Payload;
 pub use crate::payload::Progress;
 use crate::protocol::{ProtocolError, Refusal, Request, Response};
+use crate::server::SPEED_MAX_DURATION;
+
+/// The grace [`STALL_BOUND`] adds to the responder's metered lifetime cap: scheduling, the final
+/// reply frame, and the transport's close delivery.
+const STALL_GRACE: Duration = Duration::from_secs(5);
+
+/// How long one payload await in a byte-bounded run may park before the client declares the peer
+/// gone: the responder's metered lifetime cap plus [`STALL_GRACE`]. A healthy peer streams chunks
+/// back to back, so silence this long means the bytes the ask still needs are not coming (the
+/// peer's cap fired, it crashed, or the link stalled). The bound is per await, so a slow but
+/// progressing transfer of any length is unaffected.
+const STALL_BOUND: Duration =
+    Duration::from_secs(SPEED_MAX_DURATION.as_secs() + STALL_GRACE.as_secs());
 
 /// What a speed test measures: one direction, or both at once.
 ///
@@ -103,8 +116,8 @@ impl Speedtest {
 }
 
 /// Drive the upload leg: ask the responder to sink, stream counted bytes until the bound, then read the
-/// count it confirmed receiving. Reports only confirmed bytes, so a shortfall (loss or truncation)
-/// surfaces rather than laundering into a plausible-but-smaller throughput.
+/// count it confirmed receiving. A byte-bounded ask the sink did not fully take ends with a typed
+/// error, never a plausible-but-smaller throughput; a time-bounded run reports the count confirmed.
 ///
 /// The payload and the reply move over the two halves of the one stream, so both are live at once. That
 /// is what lets a refusal land: a responder that will not serve the ask (busy, or an ask over its byte
@@ -143,23 +156,45 @@ where
                 Response::Unsupported { code, detail } => {
                     return Err(ProtocolError::Refused(Refusal::Method { code, detail }));
                 }
-                // The responder closed its drain before the send returned: its count is the whole
-                // result, whether the client's bound or the responder's own ended the run.
-                Response::Received { bytes } => return Ok(bytes),
+                // The sink replied before the send returned: a byte-bounded ask it did not fully
+                // take ended early, and a short count cannot stand in for the ask.
+                Response::Received { bytes } => {
+                    return match limit.shortfall(bytes) {
+                        Some(error) => Err(error),
+                        None => Ok(bytes),
+                    };
+                }
                 _ => return Err(ProtocolError::Mismatched),
             },
             sent = &mut send => sent?,
         }
     };
+    // The send stopped at the stall bound, not the ask: the peer stopped taking bytes, so the bytes
+    // the ask still needs can never arrive.
+    if let Some(error) = limit.shortfall(sent) {
+        return Err(error);
+    }
     // Signal end-of-payload so the responder stops draining and replies with its count.
     writer.shutdown().await?;
-    let bytes = match reply.await? {
+    let frame = match limit {
+        // Every asked byte is written; the sink still owes its count. A peer that stops before
+        // sending it ended the run, so the wait is bounded rather than parked on.
+        Limit::ByBytes(asked) => match tokio::time::timeout(STALL_BOUND, reply).await {
+            Ok(frame) => frame?,
+            Err(_silent) => return Err(ProtocolError::EndedEarly { moved: sent, asked }),
+        },
+        Limit::ByTime(_) => reply.await?,
+    };
+    let bytes = match frame {
         Response::Received { bytes } => bytes,
         Response::Unsupported { code, detail } => {
             return Err(ProtocolError::Refused(Refusal::Method { code, detail }));
         }
         _ => return Err(ProtocolError::Mismatched),
     };
+    if let Some(error) = limit.shortfall(bytes) {
+        return Err(error);
+    }
     if bytes < sent {
         tracing::warn!(
             sent,
@@ -191,6 +226,12 @@ where
     // with `Unsupported`, which must short-circuit as a typed `Refused`, never drain as zero bytes.
     expect_sourcing(reader).await?;
     let received = limit.payload(started, progress).drain(reader).await?;
+    // A byte-bounded drain that stopped before its count (a clean early close, or the stall bound
+    // ending a parked read) is a stream that ended early, never a smaller throughput. A time-bounded
+    // drain stops by design, so its count is the result.
+    if let Some(error) = limit.shortfall(received) {
+        return Err(error);
+    }
     // A time-bounded download sources unbounded, so the client's deadline (which just fired to end the
     // drain) is the sole terminator. Shutting the write half sends a clean FIN so the responder's next
     // flood write hits a broken pipe and it stops. A byte-bounded download already ended on the count.
@@ -204,8 +245,9 @@ where
 /// per-leg framing to interleave on the shared write half, and no trailing reply to corrupt the drain.
 /// Upload here is client-sent bytes (there is no `Received` confirmation frame in this mode, since a
 /// reply frame appended to the source payload would corrupt the download count); a reliable stream
-/// delivers what was sent, so sent bytes are the honest upload figure. Works over quirk: a single
-/// bidirectional stream carries both halves.
+/// delivers what was sent, so sent bytes are the honest upload figure. A byte-bounded run either moves
+/// the whole ask in both directions or ends with the typed short-stream error. Works over quirk: a
+/// single bidirectional stream carries both halves.
 async fn bidir<W, R>(
     writer: &mut W,
     reader: &mut R,
@@ -240,9 +282,19 @@ where
     };
 
     let (up, down) = tokio::join!(send, drain);
+    let (sent, received) = (up?, down?);
+    // A byte-bounded bidir is only honest when both legs moved the whole ask: a stalled send or a
+    // short drain means the peer stopped, so the run is a typed error rather than a pair of partial
+    // throughputs. The download leg is named first, since its count is the received side.
+    if let Some(error) = limit.shortfall(received) {
+        return Err(error);
+    }
+    if let Some(error) = limit.shortfall(sent) {
+        return Err(error);
+    }
     Ok(Legs {
-        up: Some(up?),
-        down: Some(down?),
+        up: Some(sent),
+        down: Some(received),
     })
 }
 
@@ -266,15 +318,38 @@ where
 impl Limit {
     /// The payload transfer this limit drives from `started`: a byte bound moves an exact count, a time
     /// bound moves chunks until its deadline. Attaches `progress` when given, so the client-side leg of a
-    /// tracked run bumps the shared counter each chunk.
+    /// tracked run bumps the shared counter each chunk, and the stall bound to a byte-bounded run (see
+    /// [`stall_bound`](Self::stall_bound)).
     fn payload(self, started: Instant, progress: Option<Progress>) -> Payload {
-        let payload = match self {
+        let mut payload = match self {
             Limit::ByBytes(bytes) => Payload::of(bytes),
             Limit::ByTime(duration) => Payload::until(started + duration),
         };
+        if let Some(stall) = self.stall_bound() {
+            payload = payload.stalling(stall);
+        }
         match progress {
             Some(progress) => payload.tracking(progress),
             None => payload,
+        }
+    }
+
+    /// The stall bound a byte-bounded run carries, or `None` for a time bound, whose own deadline
+    /// ends it. A byte-bounded ask has no client-side terminator of its own, so a peer that stops
+    /// mid-ask must be bounded rather than parked on.
+    fn stall_bound(self) -> Option<Duration> {
+        matches!(self, Self::ByBytes(_)).then_some(STALL_BOUND)
+    }
+
+    /// The typed error for a byte-bounded run that moved fewer bytes than it asked for, or `None`
+    /// when the run is time-bounded (a short count is its design) or the ask was met. A short
+    /// byte-bounded ask is never reported as a smaller success; the refusal rule binds here.
+    fn shortfall(self, moved: u64) -> Option<ProtocolError> {
+        match self {
+            Self::ByBytes(asked) if moved < asked => {
+                Some(ProtocolError::EndedEarly { moved, asked })
+            }
+            _ => None,
         }
     }
 
@@ -377,3 +452,7 @@ impl Throughput {
         (self.bytes as f64 / (1024.0 * 1024.0)) / secs
     }
 }
+
+#[cfg(test)]
+#[path = "speed_tests.rs"]
+mod speed_tests;

@@ -5,6 +5,13 @@ All notable changes to services, newest first.
 ## Unreleased
 
 ### Fixed
+- **A byte-bounded `speed` run that stops short fails typed instead of hanging or reporting the short
+  count.** A run at the metered cap parked at `0.00 MiB/s` with no totals (the responder's 15-second
+  lifetime cap closed a source the client never saw close), and the upload direction exited 0 with a
+  short count. The client now bounds each payload wait by the responder's lifetime cap plus a grace and
+  ends a byte-bounded run that cannot move the asked bytes with a typed `EndedEarly` error in every mode
+  (down, up, bidir); a short run is never a smaller throughput. Time-bounded runs and the wire are
+  unchanged.
 - **An over-cap `speed` request is refused before any payload, not truncated.** A metered responder
   answered an explicit request for more bytes than its byte cap by clamping the transfer and closing, so
   a client asking for more than the cap waited on bytes that would never arrive (public `speed -n 128MiB`
