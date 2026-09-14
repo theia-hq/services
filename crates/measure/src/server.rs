@@ -46,8 +46,10 @@ const PING_MAP_MAX: usize = 8192;
 const SPEED_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// The longest a speed stream may run before the responder stops it. Sized above a normal diagnostic
 /// window (seconds, not minutes) so a bounded run completes, while a caller-held stream still ends; the
-/// byte cap bounds volume, this bounds lifetime.
-const SPEED_MAX_DURATION: Duration = Duration::from_secs(15);
+/// byte cap bounds volume, this bounds lifetime. The client's stall bound is derived from it
+/// ([`crate::speed`]'s `STALL_BOUND`), because a responder stopped at its cap and a peer gone silent
+/// look the same from the other end of the stream.
+pub(crate) const SPEED_MAX_DURATION: Duration = Duration::from_secs(15);
 
 /// The responder-side bounds a measurement engine enforces, as two named profiles.
 ///

@@ -39,6 +39,10 @@ only ones the proof will open. The caller owns admission.
   request for more bytes than the byte cap allows is refused with the typed Layer-2 frame before any
   payload; an unbounded run is clamped to the cap and stops at the wall clock (a capped sink replies with
   the bytes it took; a capped source closes early). An owner `speed` bounds neither and takes no slot.
+- **A byte-bounded client run that stops short fails typed.** Each payload wait is bounded by the
+  responder's lifetime cap plus a small grace, so a peer that stops sending (or taking) bytes before the
+  asked count ends the run with `ProtocolError::EndedEarly`, never a parked client or a short count
+  reported as a throughput. A time-bounded run still reports the bytes it moved.
 - **An owner diagnostic has no caps of its own.** The serving transport's session and stream table (256
   sessions, 256 streams per session) is the only bound, so a member admitted by the gate can drain the
   uplink. An open route binds the metered engines.
