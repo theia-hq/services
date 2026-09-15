@@ -2,6 +2,14 @@
 
 All notable changes to services, newest first.
 
+## v0.1.1
+
+Sibling pins move to bifrost v0.1.1 and tightbeam-handler from tightbeam v0.5.1; no engine behavior change.
+
+### Changed
+- **The bifrost pin follows the v0.1.1 hotfix.** The bind-role split lands under the engines unchanged; the
+  tightbeam-handler pin moves with it.
+
 ## v0.1.0
 
 The first release of the four engines, consumed today only by swoosh: `fetch`, `measure`, `sshh`, and
