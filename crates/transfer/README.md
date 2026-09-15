@@ -20,7 +20,7 @@ into the node's sink has no public use), bound to the `recv:` route. The protoco
 Each instance owns its sink directory and its per-stream temp tag, so two receive services never share a
 sink and concurrent pushes never contend for the same temp path. The caller owns admission and disk bounds.
 
-## Honest limits
+## The limits
 
 - **No byte cap.** An admitted sender can fill the output directory. The caller bounds disk.
 - **Receive only.** This crate is the receiver's per-stream work. The sender side (dial, directory walk,

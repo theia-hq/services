@@ -32,7 +32,7 @@ the node identity with the exported `host_seed(&secret)`.
 It is its own crate so the heavy, security-sensitive dependency tree (`russh`, `ssh-key`, `pty-process`)
 stays out of programs that do not serve a shell.
 
-## Honest limits
+## The limits
 
 - **The shell is remote code execution by construction.** The guards bound how many shells run and who can
   start one; they do not make a shell safe to expose. Who reaches it, and with what capability, is the
