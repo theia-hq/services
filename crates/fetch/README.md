@@ -37,7 +37,7 @@ Two `Handler` impls, two ceilings:
 The protocol body is crate-private. The caller owns admission and exposure. The `http` module publishes the
 request and response framing, so the caller's client side speaks the same wire.
 
-## Honest limits
+## The limits
 
 - **`GET` and `HEAD` only.** Other methods are refused. Redirects are forwarded to the requester, not
   followed here: the caller decides whether to follow.

@@ -59,7 +59,7 @@ will open.
 Each engine README names its handler types and the policy the caller keeps. Git is the only source today, so
 pinning a rev is available if you want a fixed point; that choice is the embedder's.
 
-## Honest limits
+## The limits
 
 - **The engines ship the ceiling, the root ships the assembly.** Each engine's handler declares its
   exposure (`Never`, or `OptIn` where an operator may open it deliberately) and its metering. The

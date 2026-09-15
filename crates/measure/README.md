@@ -30,7 +30,7 @@ one-second ping-run interval per caller, a 60-second and 1 GiB ping stream cap, 
 refuses them even if a hand-assembled router names one; the metered engines declare `OptIn` and are the
 only ones the proof will open. The caller owns admission.
 
-## Honest limits
+## The limits
 
 - **Exposure-coupled metering, by type.** The metered engines are the only openable ones and always carry
   the caps; the owner engines are unbounded and can never be opened. That coupling is structural, not an
