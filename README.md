@@ -1,7 +1,7 @@
 # services
 
-A collection of engines that serve tightbeam services. A node serves whichever ones it needs, and each
-engine does one job on an admitted stream.
+The general service engines: fetch, measure, sshh, and transfer, each serving one job on an
+already-admitted stream, usable on their own over tightbeam. A node serves whichever ones it needs.
 
 The engines are libraries, and your program keeps the transport, the identity, the gate, and the launcher.
 Each engine ships its own entry: a `Handler` impl that declares the service's exposure ceiling (`Never`, or
@@ -18,6 +18,8 @@ sees how the peer was reached or admitted; it gets a prepared proof and a stream
   stream's admission is the only credential.
 - **[transfer](crates/transfer/README.md)**: receive one pushed file off an admitted stream, verified end to end with BLAKE3 and saved
   under an output directory.
+
+This page describes the default branch.
 
 ## Build it and test it
 
