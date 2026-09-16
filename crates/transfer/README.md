@@ -10,8 +10,7 @@ A sender-supplied name is reduced to a safe relative path first: roots, prefixes
 a peer can never write outside the output directory. An empty or all-stripped name falls back to
 `download`.
 
-One stream carries one file. The caller accepts the sender's per-file streams and calls this once per
-stream; a directory's files can arrive in parallel with no fan-out logic in this crate.
+One stream carries one file. Call it once per stream; this crate has no fan-out of its own.
 
 ## The entry point
 
@@ -29,8 +28,7 @@ sink and concurrent pushes never contend for the same temp path. The caller owns
   removed, so the sender starts that file over.
 - **Concurrent calls need distinct tags.** The tag names the temp file (`.transfer-<pid>-<tag>.part`), so
   two streams that share a tag share a temp path.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
-  without notice.
+- **Experimental.** The API changes without notice.
 
 ## License
 

@@ -57,8 +57,7 @@ only ones the proof will open. The caller owns admission.
   a second run needs a new value.
 - **A probe failure counts as loss, except a refusal.** A refused method short-circuits the run with a
   typed error rather than folding into the loss figure.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
-  without notice.
+- **Experimental.** The API changes without notice.
 
 ## License
 
