@@ -21,7 +21,7 @@ the SSRF guard.
 
 The check is over the normalized `(scheme, host, port)` triple, compared exactly. A request URL carrying
 userinfo (`https://user@host/`) is rejected outright, so it can never be parsed around to a different
-host.
+host. A declared origin that does not parse fails at setup with a typed `OriginError` naming the fault.
 
 ## The entry points
 
@@ -51,8 +51,7 @@ request and response framing, so the caller's client side speaks the same wire.
 - **The allowlist gates the origin only.** The path and query are the requester's to choose.
 - **TLS terminates at the node.** The node handles the request and response in plaintext; the requester
   trusts the node, not the origin certificate.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The API changes
-  without notice.
+- **Experimental.** The API changes without notice.
 
 ## License
 

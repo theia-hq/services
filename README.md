@@ -56,8 +56,7 @@ which carries the public safety caps by construction and takes no profile. The o
 `Never`, so the public proof refuses it; the metered entry declares `OptIn` and is the only one the proof
 will open.
 
-Each engine README names its handler types and the policy the caller keeps. Git is the only source today, so
-pinning a rev is available if you want a fixed point; that choice is the embedder's.
+Each engine README names its handler types and the policy the caller keeps.
 
 ## The limits
 
@@ -67,10 +66,8 @@ pinning a rev is available if you want a fixed point; that choice is the embedde
   metered entry is capped by construction and `OptIn` (the only one an open route can bind). Admission,
   the open decision, transport, and identity stay in the embedding program. This repo ships no gate, no
   registry, and no binary. Each engine README carries that engine's limits.
-- **Experimental.** Version `0.0.0`, `publish = false`, consumed from git. The APIs change
-  without notice.
-- **One repo, one rev.** All four engines share a rev; a bump for one moves the pin for the others. A
-  consumer depends on only the crate it needs.
+- **Experimental.** The APIs change without notice.
+- **The engines move together.** Bump the rev for one and you get all four at it.
 
 ## License
 
