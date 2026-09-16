@@ -24,24 +24,32 @@ pub(crate) async fn receive_file<W, R>(
     reader: R,
     out: &Path,
     tag: u64,
-) -> eyre::Result<Received>
+) -> Result<Received, ReceiveError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
     let temp = out.join(format!(".transfer-{}-{tag}.part", std::process::id()));
     let received = {
-        let file = tokio::fs::File::create(&temp).await?;
-        let mut sink = file;
+        let mut sink =
+            tokio::fs::File::create(&temp)
+                .await
+                .map_err(|source| ReceiveError::CreateTemp {
+                    path: render_path(&temp),
+                    source,
+                })?;
         match Transfer::new(writer, reader).recv(&mut sink).await {
             Ok(received) => {
-                sink.flush().await?;
+                sink.flush().await.map_err(|source| ReceiveError::Flush {
+                    path: render_path(&temp),
+                    source,
+                })?;
                 received
             }
             Err(err) => {
                 drop(sink);
                 let _ = tokio::fs::remove_file(&temp).await;
-                return Err(err.into());
+                return Err(ReceiveError::Transfer(err));
             }
         }
     };
@@ -49,18 +57,73 @@ where
     let relative = safe_relative_path(&received.header);
     let final_path = out.join(&relative);
     if let Some(parent) = final_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| ReceiveError::CreateDir {
+                path: render_path(parent),
+                source,
+            })?;
     }
-    // The error text is logged by the serve loop at warn, so the peer-supplied path renders through the
-    // same escape/cap helper as the success event: a raw newline or ESC may not ride the warn line.
+    // Every path in an error renders through the same escape/cap helper as the success event: the serve
+    // loop logs the text at warn, and the sender names the final path, so a raw newline or ESC may not
+    // ride the line.
     tokio::fs::rename(&temp, &final_path)
         .await
-        .map_err(|err| eyre::eyre!("save to {}: {err}", render_path(&final_path)))?;
+        .map_err(|source| ReceiveError::Save {
+            path: render_path(&final_path),
+            source,
+        })?;
 
     Ok(Received {
         path: relative,
         bytes: received.blob.len(),
     })
+}
+
+/// Why one pushed file was not saved. Each arm names the step that failed and the path it failed at,
+/// already rendered safe for a log line; the transfer arm carries the wire's own typed failure (a bad
+/// frame, a truncated stream, a blob that did not verify).
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiveError {
+    /// The temp file under the output directory could not be created.
+    #[error("create the temp file {path}: {source}")]
+    CreateTemp {
+        /// The temp path, rendered for a log line.
+        path: String,
+        /// The filesystem failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The wire transfer failed: a protocol fault, a truncated stream, or a blob that did not verify.
+    #[error(transparent)]
+    Transfer(#[from] bifrost::wire::Error),
+    /// The verified bytes could not be flushed to the temp file.
+    #[error("flush {path}: {source}")]
+    Flush {
+        /// The temp path, rendered for a log line.
+        path: String,
+        /// The filesystem failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The destination's parent directory could not be created.
+    #[error("create the directory {path}: {source}")]
+    CreateDir {
+        /// The directory, rendered for a log line.
+        path: String,
+        /// The filesystem failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The verified temp file could not be moved onto the destination the sender named.
+    #[error("save to {path}: {source}")]
+    Save {
+        /// The destination, rendered for a log line (the sender chose it).
+        path: String,
+        /// The filesystem failure.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// One received file: the safe relative path it was saved at under the output directory, and its verified

@@ -9,8 +9,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::http::{FetchRequest, FetchResponse};
 use crate::origin::OriginAllowlist;
 use crate::serve::{
-    FETCH_MAX_BYTES, FETCH_TIMEOUT_MESSAGE, FETCH_TOTAL_TIMEOUT, Limits, allowed_method, bounded,
-    forward_headers, is_public, serve_fetch, stream_response,
+    FETCH_MAX_BYTES, FETCH_TIMEOUT_MESSAGE, FETCH_TOTAL_TIMEOUT, FetchError, Limits,
+    allowed_method, bounded, forward_headers, is_public, serve_fetch, stream_response,
 };
 
 #[test]
@@ -183,14 +183,16 @@ async fn a_hanging_origin_is_cut_off_by_the_total_timeout() {
             .get(format!("http://{addr}/"))
             .send()
             .await
-            .map_err(|error| error.to_string())
+            .map_err(FetchError::Request)
     })
     .await;
 
-    assert_eq!(
-        outcome.expect_err("the hang must trip the deadline"),
-        FETCH_TIMEOUT_MESSAGE
+    let error = outcome.expect_err("the hang must trip the deadline");
+    assert!(
+        matches!(error, FetchError::TimedOut),
+        "the deadline yields the typed timeout, got {error:?}"
     );
+    assert_eq!(error.to_string(), FETCH_TIMEOUT_MESSAGE);
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "the deadline, not the origin, ends the wait"

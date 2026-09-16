@@ -15,7 +15,7 @@ use tokio::io::{self, AsyncWriteExt as _};
 use tokio::time;
 
 use crate::http::{FetchRequest, FetchResponse, MAX_HEADERS};
-use crate::origin::OriginAllowlist;
+use crate::origin::{OriginAllowlist, OriginError};
 
 /// How long to wait for a connector to send its fetch frame before dropping the stream. The exposer's
 /// pre-gate request timeout does not cover this frame (it is read AFTER admission), so an admitted peer
@@ -29,8 +29,60 @@ pub(crate) const FETCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// covers a hanging connect and an endless body, so a stranger's fetch cannot park a stream open.
 pub(crate) const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The error a metered fetch reports when the origin misses [`FETCH_TOTAL_TIMEOUT`] before any header.
+/// The text a metered fetch puts on the wire when the origin misses [`FETCH_TOTAL_TIMEOUT`] before any
+/// header: the rendering of [`FetchError::TimedOut`].
 pub(crate) const FETCH_TIMEOUT_MESSAGE: &str = "origin fetch timed out";
+
+/// Why one origin fetch was refused, before or at the origin. Every refusal the responder can produce is
+/// one arm here, so the engine matches a cause rather than assembling a message at the site; the requester
+/// reads the rendering as the [`FetchResponse::Error`] text, since a cause cannot cross the wire as a type.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FetchError {
+    /// The request named a method other than GET or HEAD.
+    #[error("method {0} not allowed (fetch is GET/HEAD only)")]
+    Method(String),
+    /// The request URL does not parse.
+    #[error("invalid url: {0}")]
+    Url(#[from] url::ParseError),
+    /// The request URL's origin is outside this service's allowlist.
+    #[error("origin {0} not allowed by this fetch service")]
+    OriginNotAllowed(String),
+    /// The request URL's scheme is not `http` or `https`.
+    #[error("scheme {0} not allowed (http/https only)")]
+    Scheme(String),
+    /// The request URL has no host, or no port and no known default.
+    #[error(transparent)]
+    Origin(#[from] OriginError),
+    /// The host did not resolve.
+    #[error("resolve {host}: {source}")]
+    Resolve {
+        /// The host the request named.
+        host: String,
+        /// The resolver's failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The host resolved to nothing.
+    #[error("{0} resolved to no addresses")]
+    NoAddresses(String),
+    /// The host resolves to at least one non-public address, the SSRF shape this service refuses whole.
+    #[error("refusing to fetch {host}: it resolves to the non-public address {ip}")]
+    NonPublic {
+        /// The host the request named.
+        host: String,
+        /// The first non-public address it resolved to.
+        ip: IpAddr,
+    },
+    /// The HTTP client could not be built.
+    #[error("http client: {0}")]
+    Client(#[source] reqwest::Error),
+    /// The origin request failed before a response header arrived.
+    #[error("origin request failed: {0}")]
+    Request(#[source] reqwest::Error),
+    /// The origin missed [`FETCH_TOTAL_TIMEOUT`] before any header.
+    #[error("{}", FETCH_TIMEOUT_MESSAGE)]
+    TimedOut,
+}
 
 /// The responder-side bounds one origin fetch enforces: the largest body it streams back and the longest
 /// the whole origin operation may run. Crate-private: [`metered`](Self::metered) is the bound the public
@@ -115,7 +167,7 @@ async fn fetch_and_stream<W: io::AsyncWrite + Unpin>(
     let deadline = limits.max_duration.map(|cap| time::Instant::now() + cap);
     let response = match bounded(deadline, fetch_origin(request, allow)).await {
         Ok(response) => response,
-        Err(message) => return FetchResponse::Error(message).write(writer).await,
+        Err(error) => return FetchResponse::Error(error.to_string()).write(writer).await,
     };
     let Some(deadline) = deadline else {
         // Unmetered: no deadline, so the origin's own end is the only terminator.
@@ -134,16 +186,16 @@ async fn fetch_and_stream<W: io::AsyncWrite + Unpin>(
     }
 }
 
-/// Await `operation` under `deadline`, mapping an elapsed deadline to the typed timeout message. `None`
+/// Await `operation` under `deadline`, mapping an elapsed deadline to [`FetchError::TimedOut`]. `None`
 /// runs the operation to completion (an unmetered fetch).
 pub(crate) async fn bounded<T>(
     deadline: Option<time::Instant>,
-    operation: impl Future<Output = Result<T, String>>,
-) -> Result<T, String> {
+    operation: impl Future<Output = Result<T, FetchError>>,
+) -> Result<T, FetchError> {
     match deadline {
         Some(deadline) => match time::timeout_at(deadline, operation).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(FETCH_TIMEOUT_MESSAGE.to_owned()),
+            Err(_elapsed) => Err(FetchError::TimedOut),
         },
         None => operation.await,
     }
@@ -160,31 +212,22 @@ pub(crate) async fn bounded<T>(
 async fn fetch_origin(
     request: &FetchRequest,
     allow: &OriginAllowlist,
-) -> Result<reqwest::Response, String> {
+) -> Result<reqwest::Response, FetchError> {
     let method = allowed_method(&request.method)?;
-    let url = reqwest::Url::parse(&request.url).map_err(|error| format!("invalid url: {error}"))?;
+    let url = reqwest::Url::parse(&request.url)?;
     // Enforce the operator's origin scope BEFORE the SSRF guard and any connection: a request outside the
     // declared origin is refused here, reading its origin from the SAME parse the guard vets below, so the
     // allowlist and the connection cannot see different hosts. An empty allowlist admits any public origin.
     if !allow.admits(&url) {
-        return Err(format!(
-            "origin {} not allowed by this fetch service",
-            url.origin().ascii_serialization()
+        return Err(FetchError::OriginNotAllowed(
+            url.origin().ascii_serialization(),
         ));
     }
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!(
-            "scheme {} not allowed (http/https only)",
-            url.scheme()
-        ));
+        return Err(FetchError::Scheme(url.scheme().to_owned()));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "url has no host".to_owned())?
-        .to_owned();
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| "url has no port".to_owned())?;
+    let host = url.host_str().ok_or(OriginError::NoHost)?.to_owned();
+    let port = url.port_or_known_default().ok_or(OriginError::NoPort)?;
     let vetted = resolve_public(&host, port).await?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -196,15 +239,12 @@ async fn fetch_origin(
         // dot-stripping here.
         .resolve(&host, vetted)
         .build()
-        .map_err(|error| format!("http client: {error}"))?;
+        .map_err(FetchError::Client)?;
     let mut outgoing = client.request(method, url);
     for (name, value) in forward_headers(&request.headers) {
         outgoing = outgoing.header(name, value);
     }
-    outgoing
-        .send()
-        .await
-        .map_err(|error| format!("origin request failed: {error}"))
+    outgoing.send().await.map_err(FetchError::Request)
 }
 
 /// Write the response frame (origin status + headers verbatim) then stream the body to the writer until
@@ -266,13 +306,11 @@ fn body_error(error: reqwest::Error) -> io::Error {
 }
 
 /// The origin method for a request method: GET and HEAD only (a fetch, not a general HTTP proxy).
-pub(crate) fn allowed_method(method: &str) -> Result<reqwest::Method, String> {
+pub(crate) fn allowed_method(method: &str) -> Result<reqwest::Method, FetchError> {
     match method {
         "GET" => Ok(reqwest::Method::GET),
         "HEAD" => Ok(reqwest::Method::HEAD),
-        other => Err(format!(
-            "method {other} not allowed (fetch is GET/HEAD only)"
-        )),
+        other => Err(FetchError::Method(other.to_owned())),
     }
 }
 
@@ -302,19 +340,22 @@ pub(crate) fn forward_headers(headers: &[(String, String)]) -> Vec<(&str, &str)>
 /// resolves to any non-public address is refused wholesale (that mix is the classic SSRF / DNS-rebinding
 /// shape), while a legitimately public host resolves only to public IPs. The returned address is what the
 /// client is pinned to, so the connection lands on a vetted IP.
-async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, String> {
+async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, FetchError> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|error| format!("resolve {host}: {error}"))?
+        .map_err(|source| FetchError::Resolve {
+            host: host.to_owned(),
+            source,
+        })?
         .collect();
     let first = *addrs
         .first()
-        .ok_or_else(|| format!("{host} resolved to no addresses"))?;
+        .ok_or_else(|| FetchError::NoAddresses(host.to_owned()))?;
     if let Some(bad) = addrs.iter().find(|addr| !is_public(addr.ip())) {
-        return Err(format!(
-            "refusing to fetch {host}: it resolves to the non-public address {}",
-            bad.ip()
-        ));
+        return Err(FetchError::NonPublic {
+            host: host.to_owned(),
+            ip: bad.ip(),
+        });
     }
     Ok(first)
 }

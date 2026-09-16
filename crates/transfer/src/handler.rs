@@ -44,9 +44,11 @@ impl Handler for Recv {
         reader: BoxRead,
     ) -> Result<(), ServeError> {
         let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
+        // The contract's stream-failure arm carries the typed cause as its source, so a consumer that
+        // downcasts still sees the `ReceiveError`, and the rendered text is the arm's own message.
         let received = crate::serve::receive_file(writer, reader, &self.out, tag)
             .await
-            .map_err(|error| ServeError::Io(std::io::Error::other(format!("{error:#}"))))?;
+            .map_err(|error| ServeError::Io(std::io::Error::other(error)))?;
         // The arrival as ONE structured event: the fields carry the facts (the safe relative path,
         // escaped and capped because a peer supplies it, and the verified byte count), and a composing
         // program's subscriber decides whether and how to render them. No user-facing prose lives here.

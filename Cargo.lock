@@ -167,7 +167,6 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.1.1"
-source = "git+https://github.com/theia-hq/bifrost?rev=dccfb1f4a82d348dc3a7b50793ff4f26f8e98962#dccfb1f4a82d348dc3a7b50793ff4f26f8e98962"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -177,7 +176,6 @@ dependencies = [
 [[package]]
 name = "bifrost-core"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=dccfb1f4a82d348dc3a7b50793ff4f26f8e98962#dccfb1f4a82d348dc3a7b50793ff4f26f8e98962"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -188,7 +186,6 @@ dependencies = [
 [[package]]
 name = "bifrost-mem"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=dccfb1f4a82d348dc3a7b50793ff4f26f8e98962#dccfb1f4a82d348dc3a7b50793ff4f26f8e98962"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -199,7 +196,6 @@ dependencies = [
 [[package]]
 name = "bifrost-transport"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=dccfb1f4a82d348dc3a7b50793ff4f26f8e98962#dccfb1f4a82d348dc3a7b50793ff4f26f8e98962"
 dependencies = [
  "bifrost-core",
  "tokio",
@@ -208,7 +204,6 @@ dependencies = [
 [[package]]
 name = "bifrost-wire"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=dccfb1f4a82d348dc3a7b50793ff4f26f8e98962#dccfb1f4a82d348dc3a7b50793ff4f26f8e98962"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -899,17 +894,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eyre"
-version = "0.6.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08309dbcc659c5549a24ddb9b27027640641b282ef5768267c7e675558986a3"
-dependencies = [
- "autocfg",
- "indenter",
- "once_cell",
-]
-
-[[package]]
 name = "fetch"
 version = "0.1.1"
 dependencies = [
@@ -919,6 +903,7 @@ dependencies = [
  "tightbeam-handler",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1430,12 +1415,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indenter"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "964de6e86d545b246d84badc0fef527924ace5134f30641c203ef52ba83f58d5"
-
-[[package]]
 name = "inout"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1630,7 +1609,6 @@ dependencies = [
 [[package]]
 name = "nauthy"
 version = "0.2.0"
-source = "git+https://github.com/theia-hq/nauthy?rev=4086838c65f176a402a746ced0b7f76992171301#4086838c65f176a402a746ced0b7f76992171301"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
@@ -2965,7 +2943,6 @@ dependencies = [
 [[package]]
 name = "tightbeam-handler"
 version = "0.4.0"
-source = "git+https://github.com/theia-hq/tightbeam?rev=6df1983f6cb77fe65dc398e79b49cddb1ae10071#6df1983f6cb77fe65dc398e79b49cddb1ae10071"
 dependencies = [
  "bifrost-core",
  "nauthy",
@@ -3160,7 +3137,7 @@ name = "transfer"
 version = "0.1.1"
 dependencies = [
  "bifrost",
- "eyre",
+ "thiserror 2.0.20",
  "tightbeam-handler",
  "tokio",
  "tracing",

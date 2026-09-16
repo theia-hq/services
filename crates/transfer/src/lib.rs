@@ -20,4 +20,4 @@ mod serve;
 
 pub use handler::Recv;
 
-pub use crate::serve::safe_relative_path;
+pub use crate::serve::{ReceiveError, Received, safe_relative_path};
