@@ -13,7 +13,7 @@ repository = "https://github.com/theia-hq/services"
 bifrost.workspace = true
 tightbeam-handler.workspace = true
 
-eyre.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros"] }
 tracing.workspace = true
 

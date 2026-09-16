@@ -16,6 +16,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "time"] }
 tracing.workspace = true
+# The URL parser `reqwest::Url` is; named directly so its parse error is a typed source, not a message.
+url = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

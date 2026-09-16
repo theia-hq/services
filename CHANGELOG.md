@@ -2,6 +2,17 @@
 
 All notable changes to services, newest first.
 
+## Unreleased
+
+### Changed
+- **Every `fetch` and `transfer` failure is a typed error.** `Origin::parse`, `OriginAllowlist::parse`,
+  and `compose_url` return `OriginError` and `ComposeError` instead of a message string, so a consumer
+  matches the cause (a userinfo-bearing origin, a missing host, a bad join) rather than reading text; the
+  refusal a requester sees on the wire renders the same words as before. `transfer`'s receive path returns
+  `ReceiveError` naming the step that failed (temp file, wire transfer, flush, directory, save) with the
+  path already rendered log-safe, and the crate drops its `eyre` dependency. All four engines now speak
+  `thiserror` at their boundaries.
+
 ## v0.1.1
 
 Sibling pins move to bifrost v0.1.1 and tightbeam-handler from tightbeam v0.5.1; no engine behavior change.

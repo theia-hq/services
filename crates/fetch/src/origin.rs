@@ -36,33 +36,28 @@ impl Origin {
     /// does not parse, carries no host, or has no port and no known default for its scheme. Used both to
     /// build the allowlist from the operator's declared origins and to derive the request's origin from the
     /// same `reqwest::Url` the SSRF guard vets, so both sides of the check see one canonical form.
-    pub fn parse(url: &str) -> Result<Self, String> {
-        let url =
-            reqwest::Url::parse(url).map_err(|error| format!("invalid origin url: {error}"))?;
+    pub fn parse(url: &str) -> Result<Self, OriginError> {
+        let url = reqwest::Url::parse(url)?;
         Self::of(&url)
     }
 
     /// The origin of an already-parsed URL: the same source the SSRF `resolve_public` reads its host from,
     /// so the allowlist check and the connection cannot see different hosts (no parse-differential).
-    pub fn of(url: &reqwest::Url) -> Result<Self, String> {
+    pub fn of(url: &reqwest::Url) -> Result<Self, OriginError> {
         // Reject userinfo (`user:pass@host`) outright rather than parsing around it: a fetch origin/request
-        // URL must carry none (delib-13 BUILD-SPEC), and refusing here fails CLOSED, so a request URL whose
-        // userinfo is dressed to look like an allowed host (`https://allowed@evil/`) AND the reverse
-        // (`https://evil@allowed/`, which parsing around would admit) never reach the matcher at all.
-        // `username()` is "" and `password()` is None when absent, so this fires only on a real `@`-authority.
+        // URL must carry none, and refusing here fails CLOSED, so a request URL whose userinfo is dressed to
+        // look like an allowed host (`https://allowed@evil/`) AND the reverse (`https://evil@allowed/`, which
+        // parsing around would admit) never reach the matcher at all. `username()` is "" and `password()` is
+        // None when absent, so this fires only on a real `@`-authority.
         if !url.username().is_empty() || url.password().is_some() {
-            return Err(
-                "url carries userinfo (user:pass@), which a fetch origin must not".to_owned(),
-            );
+            return Err(OriginError::Userinfo);
         }
-        let host = url.host_str().ok_or_else(|| "url has no host".to_owned())?;
+        let host = url.host_str().ok_or(OriginError::NoHost)?;
         // Lowercase, then strip a SINGLE trailing dot so the rooted-FQDN form `host.` equals `host`; do not
         // strip more than one (`host..` is not `host`).
         let host = host.to_ascii_lowercase();
         let host = host.strip_suffix('.').unwrap_or(&host).to_owned();
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| "url has no port".to_owned())?;
+        let port = url.port_or_known_default().ok_or(OriginError::NoPort)?;
         Ok(Self {
             scheme: url.scheme().to_ascii_lowercase(),
             host,
@@ -81,7 +76,7 @@ impl OriginAllowlist {
     /// Build an allowlist from the operator's declared origin strings (`https://news.example`), parsing each
     /// to its normalized [`Origin`]. A malformed origin fails HERE, at expose time, not at dial time as an
     /// opaque refusal.
-    pub fn parse<I, S>(origins: I) -> Result<Self, String>
+    pub fn parse<I, S>(origins: I) -> Result<Self, OriginError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -127,12 +122,49 @@ impl OriginAllowlist {
 /// A pure edge helper that marshals two strings through the `reqwest::Url` parser (the same parser the SSRF
 /// guard and the origin allowlist use), so the composed URL is well-formed by the same grammar the fetch
 /// then vets. The caller decides how a root request (`/`) is treated; this always joins.
-pub fn compose_url(base: &str, target: &str) -> Result<String, String> {
-    let base = reqwest::Url::parse(base).map_err(|error| format!("invalid fetch url: {error}"))?;
-    let joined = base
-        .join(target)
-        .map_err(|error| format!("invalid request path {target}: {error}"))?;
+pub fn compose_url(base: &str, target: &str) -> Result<String, ComposeError> {
+    let base = reqwest::Url::parse(base).map_err(ComposeError::Base)?;
+    let joined = base.join(target).map_err(|source| ComposeError::Target {
+        target: target.to_owned(),
+        source,
+    })?;
     Ok(joined.into())
+}
+
+/// Why a URL could not be read as an [`Origin`]. Each arm is one shape the parse refuses, so a caller
+/// matches the cause instead of reading a message, and the expose-time error names the exact fault.
+#[derive(Debug, thiserror::Error)]
+pub enum OriginError {
+    /// The text is not a URL.
+    #[error("invalid origin url: {0}")]
+    Url(#[from] url::ParseError),
+    /// The URL carries `user:pass@`. Refused whole, never parsed around, so a host dressed as userinfo (or
+    /// the reverse) cannot reach the matcher.
+    #[error("url carries userinfo (user:pass@), which a fetch origin must not")]
+    Userinfo,
+    /// The URL names no host.
+    #[error("url has no host")]
+    NoHost,
+    /// The URL names no port and its scheme has no known default.
+    #[error("url has no port")]
+    NoPort,
+}
+
+/// Why a base and a target could not compose into one request URL.
+#[derive(Debug, thiserror::Error)]
+pub enum ComposeError {
+    /// The base is not a URL.
+    #[error("invalid fetch url: {0}")]
+    Base(#[source] url::ParseError),
+    /// The target does not join onto the base under the URL grammar.
+    #[error("invalid request path {target}: {source}")]
+    Target {
+        /// The request path and query the caller asked to join.
+        target: String,
+        /// The join failure.
+        #[source]
+        source: url::ParseError,
+    },
 }
 
 #[cfg(test)]
