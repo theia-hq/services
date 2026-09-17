@@ -2,7 +2,9 @@
 
 All notable changes to services, newest first.
 
-## Unreleased
+## v0.1.2
+
+Every failure in every engine is a typed error.
 
 ### Changed
 - **Every `fetch` and `transfer` failure is a typed error.** `Origin::parse`, `OriginAllowlist::parse`,
