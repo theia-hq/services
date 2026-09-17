@@ -73,7 +73,7 @@ fn ssrf_guard_allows_ordinary_public_addresses() {
     }
 }
 
-/// The internal limits carry the ratified caps: `metered` (what every scoped fetch enforces) is the two
+/// The internal limits carry the shipped caps: `metered` (what every scoped fetch enforces) is the two
 /// constants, and `unmetered` (the member-only unscoped path) carries none.
 #[test]
 fn metered_limits_carry_the_fetch_caps() {

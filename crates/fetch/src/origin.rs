@@ -22,8 +22,8 @@
 ///
 /// A URL with userinfo (`https://api.github.com@evil.example/`) is REJECTED here, never parsed to its host:
 /// so neither the userinfo dressed as the allowed host nor the reverse (`https://evil.example@api.github.com/`)
-/// can reach the matcher. This fails CLOSED and keeps the code and the delib-13 BUILD-SPEC ("reject userinfo
-/// entirely") in agreement.
+/// can reach the matcher. Userinfo is rejected ENTIRELY rather than stripped, because a stripping step is
+/// a second reading of the URL, and any disagreement between it and the matcher is the evasion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
     scheme: String,

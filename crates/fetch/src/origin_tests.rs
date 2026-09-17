@@ -1,5 +1,5 @@
 //! The origin allowlist host matcher: the whole security value of an origin-scoped fetch service. Each
-//! test is an evasion the matcher must refuse, or a legitimate variant it must admit (delib-13 footgun): the
+//! test is an evasion the matcher must refuse, or a legitimate variant it must admit: the
 //! matcher gates the normalized (scheme, host, port) triple, never a suffix, and is not fooled by userinfo,
 //! case, a trailing dot, or a scheme/port mismatch. An empty allowlist stays unconstrained (back-compat).
 

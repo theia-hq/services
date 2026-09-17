@@ -12,9 +12,9 @@ use tokio::time;
 use super::{Limit, STALL_BOUND, bidir, download, upload};
 use crate::protocol::{ProtocolError, Request, Response};
 
-/// A stalled byte-bounded download must end at the stall bound with the typed error, not park: the
-/// shape the Operator measured when a metered source stopped at its lifetime cap and the close
-/// never reached the client.
+/// A stalled byte-bounded download must end at the stall bound with the typed error, not park: the shape
+/// a live run takes when a metered source stops at its lifetime cap and the close never reaches the
+/// client.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_download_ends_early_instead_of_parking() {
     let asked = 8 * 1024u64;
