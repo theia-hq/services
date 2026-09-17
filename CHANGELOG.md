@@ -5,6 +5,12 @@ All notable changes to services, newest first.
 ## Unreleased
 
 ### Changed
+- **The sibling pins follow bifrost, nauthy, and tightbeam.** No engine behavior changes; the bumps carry
+  the required transport bind-truth accessor, the pointer-sized `Link`, and the router split.
+
+## Unreleased
+
+### Changed
 - **Every `fetch` and `transfer` failure is a typed error.** `Origin::parse`, `OriginAllowlist::parse`,
   and `compose_url` return `OriginError` and `ComposeError` instead of a message string, so a consumer
   matches the cause (a userinfo-bearing origin, a missing host, a bad join) rather than reading text; the
