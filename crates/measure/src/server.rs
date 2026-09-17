@@ -31,9 +31,9 @@ use crate::responder::{self, PingCaps, SpeedCaps};
 /// is echoed until the run ends at its stream caps.
 const PING_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// The largest number of stream bytes one ping run may move: the fixed-width requests plus their echoes,
-/// whichever fills first. Sized at the G4 order of magnitude (about 1 GiB per public stream, the delib-49
-/// guard list); a real run ends on the 60-second deadline first, so this is the pathological-rate
-/// backstop, not the working bound.
+/// whichever fills first. Sized at about 1 GiB per public stream, the order of magnitude the node's public
+/// capacity guards are built around; a real run ends on the 60-second deadline first, so this is the
+/// pathological-rate backstop, not the working bound.
 const PING_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// The longest a ping stream may run before the responder stops it. Sized above an honest probe run while
 /// still ending a caller-held stream: the per-caller interval bounds how often one caller can open runs,
@@ -73,7 +73,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// The public safety profile: the G4 caps an openable diagnostic runs under. Every field is a bound.
+    /// The public safety profile: the caps an openable diagnostic runs under. Every field is a bound.
     pub fn metered() -> Self {
         Self {
             ping_interval: Some(PING_MIN_INTERVAL),

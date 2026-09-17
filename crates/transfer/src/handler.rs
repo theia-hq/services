@@ -71,8 +71,8 @@ impl Handler for Recv {
 /// leaves printable text alone except grapheme-extended marks, which it escapes (a combining accent
 /// renders as `\u{...}`; an emoji passes raw).
 ///
-/// INTERIM (delib-63): the engine renders here only because the root-owned typed sink does not exist yet;
-/// once the root renderer lands it owns this rule, and this helper moves with it.
+/// INTERIM: the engine renders here only because a root-owned typed sink does not exist yet; once that
+/// renderer lands it owns this rule, and this helper moves with it.
 pub(crate) fn render_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     // The cap plus the `...` cut marker: allocation is bounded whatever the peer names.
