@@ -2,6 +2,15 @@
 
 All notable changes to services, newest first.
 
+## v0.1.6
+
+The pins follow nauthy v0.3.0, where a busy host stops refusing valid capabilities.
+
+### Changed
+- **Pinned to nauthy v0.3.0, tightbeam v0.8.0 and bifrost v0.2.2.** No engine behaviour changes. The
+  nauthy bump is the point: every capability check there ran on a one-millisecond wall-clock budget, so a
+  loaded host refused a valid capability and reported it as a denial.
+
 ## v0.1.5
 
 The sibling pins follow bifrost v0.2.1 and tightbeam v0.7.1.
