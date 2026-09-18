@@ -2,6 +2,15 @@
 
 All notable changes to services, newest first.
 
+## v0.1.5
+
+The sibling pins follow bifrost v0.2.1 and tightbeam v0.7.1.
+
+### Changed
+- **Pinned to bifrost v0.2.1 and tightbeam v0.7.1.** No engine behaviour changes. Both bumps are additive
+  upstream, and the pins move here so a consumer pinning these engines alongside either sibling resolves
+  one copy of each rather than two.
+
 ## v0.1.4
 
 The handler pin follows tightbeam v0.7.0, where every target carries a scheme.
