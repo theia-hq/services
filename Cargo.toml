@@ -13,13 +13,13 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does NOT
 # slow local builds (the patch wins locally regardless of the rev); CI (no parent config) resolves the rev
 # from GitHub. All bifrost-* crates live in one repo, so they share one rev.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "72f0b33e77e590f552907b60f50bb2a679a93707" }
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "72f0b33e77e590f552907b60f50bb2a679a93707" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "2b86559ddd22753673f86dd403648cbd1abd2fa0" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "70a7c7e122300a9956874af76873950b24fc1dda" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "70a7c7e122300a9956874af76873950b24fc1dda" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "fcd30ccd295aee03a7b0b12de4ebf4b8b7e09d54" }
 # The lean handler contract in tightbeam's repo, pinned from the same repo as tightbeam itself. The pin
 # moves with the extraction commit in the family cascade; the same nauthy rev must resolve across services,
 # tightbeam-handler, and tightbeam or the witness types do not match at compile time.
-tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "5a7160c9358b05b8e9ef913b1f141d2508ade3fd" }
+tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "8119d546e4f2767a4c79f04ee2c15df6d4a88981" }
 
 eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
