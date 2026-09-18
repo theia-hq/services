@@ -124,3 +124,28 @@ async fn rejects_a_detail_that_is_not_utf8() {
         Err(ProtocolError::BadDetail(RefusalDetailError::NotUtf8))
     ));
 }
+
+/// A session failure that is not a refusal becomes the stream variant, and its message must not name an
+/// operation it did not perform. A client renders this error chained over its cause, so an outer half
+/// reading `read frame` describes a read to someone whose stream never opened.
+#[test]
+fn a_stream_failure_does_not_claim_a_read() {
+    let error = ProtocolError::from(bifrost::Error::Stream("peer went away".into()));
+    let rendered = error.to_string();
+
+    assert!(
+        !rendered.contains("read"),
+        "the stream variant covers open, read, and close alike: {rendered}"
+    );
+    let mut chain = rendered.clone();
+    let mut next = core::error::Error::source(&error);
+    while let Some(cause) = next {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        next = cause.source();
+    }
+    assert_eq!(
+        chain, "stream: peer went away",
+        "a client chaining the causes reads the failure and its detail, and nothing invented"
+    );
+}

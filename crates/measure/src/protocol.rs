@@ -397,8 +397,13 @@ pub enum ProtocolError {
     /// The refusal code was not recognized: a corrupt or future stream, never guessed at.
     #[error("unknown refusal code {0:#04x}")]
     UnknownRefusalCode(u8),
-    /// The underlying stream failed while reading a frame.
-    #[error("read frame")]
+    /// The underlying stream failed. Every non-refusal session failure lands here, including one that
+    /// happened while OPENING the stream or while closing it, so this variant must not name an operation
+    /// of its own: it used to read `read frame`, which described a read to a caller whose stream had never
+    /// opened. Transparent, so the rendered text is the failure's own and a client that chains the causes
+    /// gets `stream: peer went away` rather than a fabricated outer half over it. The variant still
+    /// carries the class for anyone matching on it.
+    #[error(transparent)]
     Io(#[from] io::Error),
 }
 
