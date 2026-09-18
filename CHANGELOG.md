@@ -2,6 +2,15 @@
 
 All notable changes to services, newest first.
 
+## v0.1.4
+
+The handler pin follows tightbeam v0.7.0, where every target carries a scheme.
+
+### Changed
+- **`tightbeam-handler` moves to tightbeam v0.7.0.** No engine behavior changes. The bump has to happen
+  here before a consumer can pin both: a consumer on the new tightbeam and these engines on the old one
+  resolves two copies of the contract crate, and the witness types stop matching.
+
 ## v0.1.3
 
 A stream failure says what failed instead of naming a read that never happened.
