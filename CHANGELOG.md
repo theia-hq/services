@@ -2,6 +2,17 @@
 
 All notable changes to services, newest first.
 
+## v0.1.3
+
+A stream failure says what failed instead of naming a read that never happened.
+
+### Fixed
+- **A non-refusal stream failure no longer claims a read.** Every session failure that is not a typed
+  refusal lands in one error variant, including one raised while opening or closing the stream, and that
+  variant rendered `read frame`. A client that chains the causes therefore printed `read frame: stream:
+  peer went away` for a stream that never opened. The variant is transparent now, so the text is the
+  failure's own: `stream: peer went away`.
+
 ## v0.1.2
 
 Every failure in every engine is a typed error.
