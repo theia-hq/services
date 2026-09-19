@@ -2,6 +2,17 @@
 
 All notable changes to services, newest first.
 
+## v0.1.7
+
+Pins bifrost v0.2.3 and tightbeam v0.8.1.
+
+### Changed
+- **bifrost v0.2.3, tightbeam v0.8.1.** Carries the temporary-address fix. A node no longer
+  publishes or hands out an RFC 8981 temporary IPv6 address: the address was scoped `Internet` and
+  so passed the advertisement's own filter, which meant a rotating privacy address went onto every
+  network the node joined, and a consumer also handed one to a human, where it is deprecated within
+  about a day.
+
 ## v0.1.6
 
 The pins follow nauthy v0.3.0, where a busy host stops refusing valid capabilities.
