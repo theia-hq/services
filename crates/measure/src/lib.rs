@@ -26,5 +26,5 @@ mod responder;
 mod reach_tests;
 
 pub use ping::{Ping, PingReport, Probe};
-pub use protocol::{MethodRefusal, ProtocolError, Refusal};
+pub use protocol::{MethodRefusal, ProtocolError, Refusal, WireVersion};
 pub use speed::{Limit, Mode, Progress, SpeedReport, Speedtest, Throughput};

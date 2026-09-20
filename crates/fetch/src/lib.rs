@@ -35,5 +35,5 @@ mod http_tests;
 #[cfg(test)]
 mod serve_tests;
 
-pub use crate::http::{FetchRequest, FetchResponse};
+pub use crate::http::{FetchRequest, FetchResponse, RequestReadError, WireVersion};
 pub use crate::origin::{ComposeError, Origin, OriginAllowlist, OriginError, compose_url};

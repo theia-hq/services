@@ -234,6 +234,51 @@ async fn a_refused_origin_writes_a_typed_error_frame() {
     );
 }
 
+/// A requester on another wire version is ANSWERED, not dropped: the typed error frame is on the wire
+/// before the stream ends, so the requester reads a sentence instead of a bare EOF. Propagate the read
+/// error with `?` ahead of the write, as it used to be, and this goes red with no frame to read.
+#[tokio::test]
+async fn a_version_skewed_requester_is_answered_not_dropped() {
+    let mut encoded = Vec::new();
+    FetchRequest {
+        method: "GET".to_owned(),
+        url: "https://example.com/".to_owned(),
+        headers: Vec::new(),
+    }
+    .write(&mut encoded)
+    .await
+    .expect("encode");
+    // One digit of the version changed, and nothing else: `TBH2`.
+    encoded[3] = b'2';
+
+    let mut reader: &[u8] = &encoded;
+    let mut writer = Vec::new();
+    serve_fetch(
+        &mut writer,
+        &mut reader,
+        &OriginAllowlist::default(),
+        Limits::metered(),
+    )
+    .await
+    .expect("a version mismatch is a served answer, not a dropped stream");
+
+    let mut output: &[u8] = &writer;
+    let frame = FetchResponse::read(&mut output)
+        .await
+        .expect("the version answer is a frame, not an EOF");
+    let FetchResponse::Error(message) = frame else {
+        panic!("a frame this build cannot parse is refused, never served: {frame:?}");
+    };
+    assert!(
+        message.contains("TBH2") && message.contains("TBH1"),
+        "{message}"
+    );
+    assert!(
+        output.is_empty(),
+        "the write half closes after the answer; no origin was reached"
+    );
+}
+
 /// Spawn a one-shot local origin: accept ONE connection, read its request head, then let `reply` write
 /// the response. The engine's SSRF guard refuses loopback by design, so the body-bound tests speak to
 /// this origin directly, through the same `reqwest::Response` a vetted fetch would produce.

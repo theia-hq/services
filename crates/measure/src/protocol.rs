@@ -8,9 +8,74 @@
 use bifrost::{RefusalDetail, RefusalDetailError};
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 
-/// Magic plus version prefixing every request. A foreign or mismatched-version stream is rejected, so
-/// a diagnostic stream is never confused with another protocol riding the same transport.
-const MAGIC: [u8; 4] = *b"DG02";
+/// measure's protocol identity: the bytes every request frame opens with, at every version, forever. A
+/// stream that does not open with these is not a measure stream, and that is the only thing an identity
+/// mismatch is allowed to mean.
+const IDENTITY: [u8; 2] = *b"DG";
+
+/// The request grammar THIS build speaks, written after [`IDENTITY`] and parsed (never compared whole)
+/// on read: together they are the four magic bytes `DG02`.
+const VERSION: WireVersion = WireVersion(*b"02");
+
+/// The magic splits by RULE, not by a remembered offset: the identity is the leading run of capitals,
+/// the version is the digits after it, four bytes in all. Held at build time so a magic that breaks the
+/// rule fails to compile rather than splitting somewhere the next reader would not look. A digit is
+/// never a capital, so "all capitals, then all digits" is exactly "the maximal leading capital run".
+const _: () = assert!(
+    all_between(&IDENTITY, b'A', b'Z')
+        && all_between(VERSION.as_bytes(), b'0', b'9')
+        && IDENTITY.len() + VERSION.as_bytes().len() == 4,
+    "the magic must be four bytes: a run of capitals (the identity) then digits (the version)"
+);
+
+/// Whether `bytes` is non-empty and every byte falls in `lo..=hi`. `const` because its one caller is a
+/// build-time claim about the magic.
+const fn all_between(bytes: &[u8], lo: u8, hi: u8) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] < lo || bytes[at] > hi {
+            return false;
+        }
+        at += 1;
+    }
+    !bytes.is_empty()
+}
+
+/// The version half of a request frame: the bytes after [`IDENTITY`], naming which request grammar the
+/// peer that wrote them speaks.
+///
+/// Parsed as a value rather than folded into one four-byte comparison, because the two halves of the
+/// magic answer different questions. An IDENTITY mismatch says the stream is not ours, and there is
+/// nothing true we could say to whatever is on the other end. A VERSION mismatch says a measure peer on
+/// another build, which is a fact both ends can act on, so it is answered on the wire
+/// ([`ProtocolError::answer`]) instead of dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireVersion([u8; 2]);
+
+impl WireVersion {
+    /// Read the version half, after the identity. The width of the field lives here, in the type that
+    /// owns it, so the reader and the writer cannot drift apart.
+    async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
+        let mut bytes = [0u8; 2];
+        reader.read_exact(&mut bytes).await?;
+        Ok(Self(bytes))
+    }
+
+    /// The bytes as they go on the wire.
+    const fn as_bytes(&self) -> &[u8; 2] {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for WireVersion {
+    /// Renders the WHOLE four-byte tag (`DG02`), because that is the form the source and the changelog
+    /// use, so a dialer handed one in a refusal can match it against what it reads. A peer's version
+    /// bytes are arbitrary and need not be printable, so they are escaped rather than trusted: this
+    /// string reaches a terminal.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}{}", IDENTITY.escape_ascii(), self.0.escape_ascii())
+    }
+}
 
 /// What a client asks a responder to do on a freshly opened stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,14 +203,16 @@ impl MethodRefusal {
 }
 
 impl Request {
-    /// The wire size of a [`Ping`](Self::Ping) request: magic, tag, sequence, and nonce. A ping frame
-    /// is fixed-width, so a stream's counted bytes and its frame count bound the same run; the byte
-    /// ceiling on a ping stream charges this per probe.
-    pub(crate) const PING_BYTES: u64 = (MAGIC.len() + 1 + 4 + 8) as u64;
+    /// The wire size of a [`Ping`](Self::Ping) request: identity, version, tag, sequence, and nonce. A
+    /// ping frame is fixed-width, so a stream's counted bytes and its frame count bound the same run;
+    /// the byte ceiling on a ping stream charges this per probe.
+    pub(crate) const PING_BYTES: u64 =
+        (IDENTITY.len() + VERSION.as_bytes().len() + 1 + 4 + 8) as u64;
 
-    /// Write the framed request: magic, tag, then the variant's fields.
+    /// Write the framed request: identity, version, tag, then the variant's fields.
     pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&MAGIC).await?;
+        writer.write_all(&IDENTITY).await?;
+        writer.write_all(VERSION.as_bytes()).await?;
         match *self {
             Request::Ping {
                 seq,
@@ -174,12 +241,21 @@ impl Request {
         }
     }
 
-    /// Read a framed request, rejecting a stream that does not open with our magic.
+    /// Read a framed request.
+    ///
+    /// The magic is parsed as [`IDENTITY`] plus a [`WireVersion`], never compared as four bytes, so
+    /// that "not our protocol" and "our protocol, another build" stay two facts instead of one. Only
+    /// the second is something the peer can act on, and [`ProtocolError::answer`] is where it gets
+    /// answered rather than logged at the wrong end.
     pub async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> Result<Self, ProtocolError> {
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic).await?;
-        if magic != MAGIC {
-            return Err(ProtocolError::BadMagic);
+        let mut identity = [0u8; IDENTITY.len()];
+        reader.read_exact(&mut identity).await?;
+        if identity != IDENTITY {
+            return Err(ProtocolError::Foreign);
+        }
+        let version = WireVersion::read(reader).await?;
+        if version != VERSION {
+            return Err(ProtocolError::Version { peer: version });
         }
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag).await?;
@@ -210,6 +286,20 @@ impl Request {
 
 /// A responder's typed reply, sent before (source, sourcing-ack) or after (ping, sink) the payload it
 /// describes. Not `Copy`: [`Unsupported`](Self::Unsupported) carries an owned detail.
+///
+/// **This frame is FROZEN.** It carries no identity and no version of its own, and every tag, refusal
+/// code, and field in it means the same thing at every version of the REQUEST frame. That is not
+/// tidiness: a host answers a peer whose request it could not parse ([`ProtocolError::answer`]), and an
+/// answer is only worth writing if a build that predates it can read it. Versioning this frame, or
+/// changing what a shipped tag means, would take the answer away and put every future wire break back
+/// to the bare EOF it used to be.
+///
+/// So: two stability classes on one wire. The request frame MAY break with a version bump, since it
+/// carries the evolving vocabulary. This one may NOT. Growth here is additive only, and an ADDED tag or
+/// refusal code is legible only to a peer that already knows it, because this reader rejects an unknown
+/// one outright ([`ProtocolError::UnknownResponse`], [`ProtocolError::UnknownRefusalCode`]) rather than
+/// reading it as a class it cannot name. A new code may therefore serve new conditions and may never
+/// carry the version answer, which has to ride a code every shipped build already decodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     /// The echoed ping, carrying the request's `seq` and nonce untouched.
@@ -346,9 +436,23 @@ async fn read_detail<R: io::AsyncRead + Unpin>(
 /// Why a diagnostic frame could not be decoded.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
-    /// The stream did not open with the measure magic (foreign or wrong-version stream).
+    /// The stream did not open with [`IDENTITY`], so it is not a measure stream. The wording is now
+    /// exactly true: it used to cover a measure peer on another version as well, which it never was.
     #[error("not a measure stream")]
-    BadMagic,
+    Foreign,
+    /// A measure stream from a build that speaks a different request grammar.
+    ///
+    /// This message goes ON THE WIRE via [`answer`](Self::answer), so it is FIXED text plus the two
+    /// version tags and nothing else. Never interpolate host state here: the only host fact it may
+    /// carry is this build's own wire version, which any peer learns by being served at all.
+    #[error(
+        "measure wire version mismatch: the request is {peer}, this host speaks {VERSION}; run the \
+         same release at both ends"
+    )]
+    Version {
+        /// The version the peer's frame named.
+        peer: WireVersion,
+    },
     /// The request tag was not recognized.
     #[error("unknown request tag {0:#04x}")]
     UnknownRequest(u8),
@@ -405,6 +509,42 @@ pub enum ProtocolError {
     /// carries the class for anyone matching on it.
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+impl ProtocolError {
+    /// The frame to write back, for the one unreadable request a peer can act on.
+    ///
+    /// A version mismatch is answerable because the identity already proved the peer speaks measure:
+    /// naming both versions tells them what happened and what to do about it. A foreign identity gets
+    /// nothing, since we cannot know what would even be meaningful to whatever is on the other end,
+    /// and every other failure either has no readable frame left or is not a framing fact at all.
+    ///
+    /// The code is [`MethodRefusal::WrongMethod`] because the answer must ride a code that ALREADY
+    /// ships. The peer it is for is by definition on another build, and a code that build has no tag
+    /// for is rejected by its reader ([`ProtocolError::UnknownRefusalCode`]) BEFORE the detail is
+    /// read, which would lose the one sentence the frame exists to carry. It is also the honest
+    /// reading: a method named in a grammar this build does not speak is not a method it serves.
+    #[must_use]
+    pub fn answer(&self) -> Option<Response> {
+        match self {
+            // The detail is this variant's own rendering, which is the whole reason that string is
+            // held to fixed text plus the two version tags.
+            Self::Version { .. } => Some(Response::Unsupported {
+                code: MethodRefusal::WrongMethod,
+                detail: RefusalDetail::bounded(self.to_string()),
+            }),
+            Self::Foreign
+            | Self::UnknownRequest(_)
+            | Self::UnknownResponse(_)
+            | Self::Mismatched
+            | Self::WrongService
+            | Self::Refused(_)
+            | Self::EndedEarly { .. }
+            | Self::BadDetail(_)
+            | Self::UnknownRefusalCode(_)
+            | Self::Io(_) => None,
+        }
+    }
 }
 
 /// Map a session-level failure onto a protocol error. A typed refusal ([`bifrost::Error::Refused`]) is a
