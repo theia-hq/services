@@ -2,6 +2,15 @@
 
 All notable changes to services, newest first.
 
+## v0.1.8
+
+Pins nauthy v0.3.1 and tightbeam v0.8.2.
+
+### Changed
+- **nauthy v0.3.1, tightbeam v0.8.2.** Takes `Cap::expiry()`, so a holder can answer when its own
+  grant dies rather than learning it from a refusal that names nothing, and the gate that enforces
+  nauthy's datalog budget funnel.
+
 ## v0.1.7
 
 Pins bifrost v0.2.3 and tightbeam v0.8.1.
