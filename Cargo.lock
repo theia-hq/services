@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "fetch"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "futures",
  "reqwest",
@@ -1541,7 +1541,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "measure"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bifrost",
  "bifrost-mem",
@@ -2827,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "sshh"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "blake3",
  "libc",
@@ -3141,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "transfer"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bifrost",
  "thiserror 2.0.20",
