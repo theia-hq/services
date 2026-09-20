@@ -2,6 +2,21 @@
 
 All notable changes to services, newest first.
 
+## v0.2.0
+
+Keeps up with a refusal type that stopped being a closed set.
+
+### Changed
+- **Picks up bifrost v0.3.0 and tightbeam v0.9.0.** bifrost's `Refusal` is now `#[non_exhaustive]`,
+  and `measure` re-exports a `Refusal` that wraps it, so a consumer matching on the stream case
+  inherits the new obligation: one more arm, for a class this build cannot name. That arm should
+  say so rather than fold the unknown class onto a known one, because standing in for the
+  not-admitted class invents an authorization ruling out of a message that carried none.
+
+  No engine changed. The wrapper passes Display through and never matches on the inner value, so
+  nothing inside this repo needed an arm. The release is minor because the obligation lands on
+  this repo's public surface, not because anything here behaves differently.
+
 ## v0.1.8
 
 Pins nauthy v0.3.1 and tightbeam v0.8.2.
