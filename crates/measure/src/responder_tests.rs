@@ -385,3 +385,44 @@ async fn a_busy_ping_stream_stops_at_the_byte_cap() {
         other => panic!("the stream must end with a typed refusal, got {other:?}"),
     }
 }
+
+/// A peer on another wire version is ANSWERED, not dropped: the refusal frame is on the wire before the
+/// stream ends, so a dialer reads a sentence instead of a bare EOF. Propagate the read error with `?`
+/// ahead of the write, as it used to be, and this goes red waiting for a frame that never comes.
+#[tokio::test]
+async fn a_version_skewed_peer_is_answered_not_dropped() {
+    let (mut client, serving) = serve_ping(PingCaps::default());
+
+    // A well-formed ping frame with one digit of the version changed: `DG03`.
+    let mut frame = Vec::new();
+    Request::Ping {
+        seq: 1,
+        sent_unix_nanos: 2,
+    }
+    .write(&mut frame)
+    .await
+    .expect("a request frame fits a vec");
+    frame[3] = b'3';
+    client
+        .write_all(&frame)
+        .await
+        .expect("the frame fits the stream");
+
+    let answer = Response::read(&mut client)
+        .await
+        .expect("the version answer is a frame, not an EOF");
+    let Response::Unsupported { code, detail } = answer else {
+        panic!("a frame this build cannot parse is refused, never served: {answer:?}");
+    };
+    assert_eq!(code, MethodRefusal::WrongMethod);
+    assert!(
+        detail.as_str().contains("DG03") && detail.as_str().contains("DG02"),
+        "{detail}"
+    );
+
+    let result = serving.await.expect("the responder task does not panic");
+    assert!(
+        matches!(result, Err(ProtocolError::Version { .. })),
+        "the host still fails the stream and logs why: {result:?}"
+    );
+}

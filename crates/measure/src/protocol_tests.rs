@@ -64,13 +64,63 @@ async fn response_variants_roundtrip() {
     }
 }
 
+/// One well-formed ping frame with the byte at `at` replaced. The two tests below differ only in WHICH
+/// half of the magic they corrupt, because that single difference is the whole claim.
+async fn frame_with(at: usize, byte: u8) -> Vec<u8> {
+    let mut buf = Vec::new();
+    Request::Ping {
+        seq: 1,
+        sent_unix_nanos: 2,
+    }
+    .write(&mut buf)
+    .await
+    .expect("a request frame fits a vec");
+    buf[at] = byte;
+    buf
+}
+
+/// A stream whose IDENTITY is not ours is not a measure stream, and it is told nothing: we cannot know
+/// what would even be meaningful to whatever is on the other end. Make the version answer fire for a
+/// foreign identity too and the first assertion goes red.
 #[tokio::test]
 async fn rejects_foreign_stream() {
-    let mut buf = b"XXXXnonsense".as_slice();
-    assert!(matches!(
-        Request::read(&mut buf).await,
-        Err(ProtocolError::BadMagic)
-    ));
+    // `XG02`: one byte of the identity changed, and nothing else.
+    let buf = frame_with(0, b'X').await;
+
+    let error = Request::read(&mut buf.as_slice())
+        .await
+        .expect_err("a foreign identity is not a measure stream");
+    assert!(
+        error.answer().is_none(),
+        "a foreign stream gets no wire answer, only a host log line"
+    );
+    assert!(matches!(error, ProtocolError::Foreign));
+}
+
+/// The version half of the magic is PARSED, so a measure peer on another build is a distinguishable
+/// condition with a wire answer, not a foreign stream. Revert the parse to a four-byte comparison and
+/// this goes red at the first assertion.
+#[tokio::test]
+async fn a_version_mismatch_is_not_a_foreign_stream() {
+    // `DG03`: one byte of the version changed, and nothing else.
+    let buf = frame_with(3, b'3').await;
+
+    let error = Request::read(&mut buf.as_slice())
+        .await
+        .expect_err("DG03 is not this build's grammar");
+    assert!(
+        !matches!(error, ProtocolError::Foreign),
+        "a measure peer on another build is not a foreign protocol"
+    );
+    let Some(Response::Unsupported { code, detail }) = error.answer() else {
+        panic!("a version mismatch is answerable on the wire: {error}");
+    };
+    // A code every shipped build already decodes, so the peer this answer is for can read it at all.
+    assert_eq!(code, MethodRefusal::WrongMethod);
+    // Both versions, so the dialer learns what it speaks AND what the host speaks; one of them alone
+    // leaves them guessing at the other.
+    assert!(detail.as_str().contains("DG03"), "{detail}");
+    assert!(detail.as_str().contains("DG02"), "{detail}");
 }
 
 #[tokio::test]

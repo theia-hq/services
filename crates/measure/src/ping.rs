@@ -3,8 +3,13 @@
 //! back, and reports min/avg/max/mdev and loss.
 //!
 //! RTT is measured locally with a monotonic [`Instant`]: the wire stamp in each frame is an opaque
-//! nonce, never a clock we trust. Only replies that arrive are counted; a dropped or corrupt reply is
-//! loss.
+//! nonce, never a clock we trust. Only replies that arrive are counted; a corrupt reply, a broken
+//! stream, and a probe still unanswered at `PROBE_TIMEOUT` are all loss.
+//!
+//! That last one is what makes loss mean here what it means to a person. A reliable stream never drops
+//! a reply, so the only way a probe goes out and nothing comes back is a peer that admitted the stream
+//! and then went quiet, which is precisely the case a client must bound rather than wait on: the peer
+//! holds the client for as long as it stays silent, and silence is not something the stream reports.
 
 use core::time::Duration;
 use std::time::Instant;
@@ -14,6 +19,25 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::time;
 
 use crate::protocol::{ProtocolError, Refusal, Request, Response};
+
+/// How long one probe may wait for its echo before the client counts it lost.
+///
+/// A fixed bound, not a derivation from the responder's ping caps, because nothing on the serving side
+/// legitimately delays an echo: the responder writes the reply as it reads the request, so a stream cap
+/// ends the run rather than holding a pong back. This differs from [`crate::speed`]'s `STALL_BOUND`,
+/// which waits out the responder's metered speed lifetime before declaring silence precisely because a
+/// metered sink may honestly owe its count for that long. Waiting a ping run's lifetime for a reply due
+/// in milliseconds would answer a hang with a slower hang.
+///
+/// The bound covers the whole probe, the request write as well as the reply read, because a peer that
+/// stops READING parks the client just as surely as one that stops answering. A request torn by the
+/// bound can only reach a peer that already stopped taking bytes, whose run is loss either way.
+///
+/// Ten seconds is the family's patience for one network step (the dial, the tunnel's admission read,
+/// the noise handshake), and a probe is one network step. It is far above the worst honest round trip,
+/// a relayed intercontinental path with a hole-punch still in flight, and short enough that a run
+/// against a wedged peer answers while the person who typed it is still watching.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One probe's outcome, handed to a live observer the instant it completes: the sequence number and its
 /// round-trip time, or `None` for a lost probe. This is what a caller watches to print a line per pong
@@ -50,18 +74,46 @@ impl Ping {
     pub async fn observing<S: Session>(
         self,
         session: &S,
-        mut observe: impl FnMut(Probe),
+        observe: impl FnMut(Probe),
     ) -> Result<PingReport, ProtocolError> {
-        let Self { count, interval } = self;
         let (mut writer, mut reader) = session.open_bi().await?;
+        let report = self.probes(&mut writer, &mut reader, observe).await?;
+        // Close the write half so the responder sees EOF and its stream task can finish cleanly.
+        writer.shutdown().await.map_err(ProtocolError::Io)?;
+        Ok(report)
+    }
 
+    /// Drive every probe of this run over one already-open stream, reporting each outcome to `observe`
+    /// as it lands. Split from the stream-opening half so a whole run, including the loss it counts, is
+    /// drivable over a plain pair of halves against a peer that answers on the terms a test chooses.
+    async fn probes<W, R>(
+        self,
+        writer: &mut W,
+        reader: &mut R,
+        mut observe: impl FnMut(Probe),
+    ) -> Result<PingReport, ProtocolError>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let Self { count, interval } = self;
         let mut rtts = Vec::with_capacity(count as usize);
         for seq in 0..count {
             if seq > 0 {
                 time::sleep(interval).await;
             }
-            let rtt = match probe(&mut writer, &mut reader, seq).await {
-                Ok(rtt) => {
+            let rtt = match time::timeout(PROBE_TIMEOUT, probe(writer, reader, seq)).await {
+                // The peer took the probe and said nothing. It is the one failure a reliable stream
+                // cannot report, so the client bounds it itself, and it counts as the lost probe a
+                // person already means by loss. The run continues: the next probe is a fresh question,
+                // and a peer that wakes up answers it. A pong that arrives after its bound lands on
+                // that next probe's read, where the nonce check rejects it, so a late reply is never
+                // credited as a fast round trip.
+                Err(_silent) => {
+                    tracing::warn!(seq, bound = ?PROBE_TIMEOUT, "ping probe unanswered");
+                    None
+                }
+                Ok(Ok(rtt)) => {
                     rtts.push(rtt);
                     Some(rtt)
                 }
@@ -69,18 +121,18 @@ impl Ping {
                 // run with the typed error rather than reading it as loss. No report is built from it.
                 // A refusal code this client does not know is the same class: it arrived in a refusal
                 // frame, so it must surface as a protocol error, never fold into loss.
-                Err(error @ (ProtocolError::Refused(_) | ProtocolError::UnknownRefusalCode(_))) => {
+                Ok(Err(
+                    error @ (ProtocolError::Refused(_) | ProtocolError::UnknownRefusalCode(_)),
+                )) => {
                     return Err(error);
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     tracing::warn!(%error, seq, "ping probe lost");
                     None
                 }
             };
             observe(Probe { seq, rtt });
         }
-        // Close the write half so the responder sees EOF and its stream task can finish cleanly.
-        writer.shutdown().await.map_err(ProtocolError::Io)?;
         Ok(PingReport { sent: count, rtts })
     }
 }
@@ -181,3 +233,7 @@ impl PingReport {
         Some(Duration::from_secs_f64(mean_abs_dev))
     }
 }
+
+#[cfg(test)]
+#[path = "ping_tests.rs"]
+mod ping_tests;

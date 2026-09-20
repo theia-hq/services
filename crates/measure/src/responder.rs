@@ -104,13 +104,9 @@ where
     R: io::AsyncRead + Unpin,
 {
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
-    let opening = match deadline {
-        Some(deadline) => match time::timeout_at(deadline, Request::read(&mut reader)).await {
-            Ok(request) => request?,
-            // The cap fired before a probe arrived; nothing was served, so the stream just closes.
-            Err(_past_deadline) => return Ok(()),
-        },
-        None => Request::read(&mut reader).await?,
+    let Some(opening) = read_opening(&mut writer, &mut reader, deadline).await? else {
+        // The cap fired before a probe arrived; nothing was served, so the stream just closes.
+        return Ok(());
     };
     match opening {
         Request::Ping {
@@ -159,13 +155,9 @@ where
     // One deadline for the whole stream: the request read and the transfer share the cap, so a caller
     // that stalls before naming a method is bounded too, never parked open until the client stops.
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
-    let request = match deadline {
-        Some(deadline) => match time::timeout_at(deadline, Request::read(&mut reader)).await {
-            Ok(request) => request?,
-            // The cap fired before a method arrived; close cleanly, nothing was served.
-            Err(_past_deadline) => return Ok(()),
-        },
-        None => Request::read(&mut reader).await?,
+    let Some(request) = read_opening(&mut writer, &mut reader, deadline).await? else {
+        // The cap fired before a method arrived; close cleanly, nothing was served.
+        return Ok(());
     };
     match request {
         Request::Ping { .. } => {
@@ -178,6 +170,42 @@ where
         }
         speed => serve_speed(&mut writer, &mut reader, speed, caps, deadline).await,
     }
+}
+
+/// Read a stream's opening request under `deadline`, telling a peer this build cannot parse WHY before
+/// the stream ends. `None` means the deadline fired before any frame arrived: nothing was served, so
+/// the caller closes cleanly.
+///
+/// The one place a stream's first frame is read, so the answer cannot be written on one method and
+/// forgotten on the other. A peer on another wire version gets a typed refusal frame naming both
+/// versions, because a wire break between two builds of one tool is a fact the person at the keyboard
+/// can act on and a closed stream is not. A foreign or broken stream has nothing true it could be
+/// told, so it ends exactly as it always did. Either way the error is returned, so the host logs why.
+async fn read_opening<W, R>(
+    writer: &mut W,
+    reader: &mut R,
+    deadline: Option<time::Instant>,
+) -> Result<Option<Request>, ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let read = match deadline {
+        Some(deadline) => match time::timeout_at(deadline, Request::read(reader)).await {
+            Ok(read) => read,
+            Err(_past_deadline) => return Ok(None),
+        },
+        None => Request::read(reader).await,
+    };
+    let error = match read {
+        Ok(request) => return Ok(Some(request)),
+        Err(error) => error,
+    };
+    let Some(answer) = error.answer() else {
+        return Err(error);
+    };
+    answer.write(writer).await?;
+    Err(error)
 }
 
 /// Answer one inbound stream on the union of both methods, dispatching on its opening

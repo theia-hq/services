@@ -14,7 +14,7 @@ use futures::StreamExt as _;
 use tokio::io::{self, AsyncWriteExt as _};
 use tokio::time;
 
-use crate::http::{FetchRequest, FetchResponse, MAX_HEADERS};
+use crate::http::{FetchRequest, FetchResponse, MAX_HEADERS, RequestReadError};
 use crate::origin::{OriginAllowlist, OriginError};
 
 /// How long to wait for a connector to send its fetch frame before dropping the stream. The exposer's
@@ -142,7 +142,8 @@ where
     // Bound the frame read: an admitted peer must send its request promptly, not hold a stream open by
     // stalling mid-frame. A timeout maps to a clean drop of this one stream.
     let request = match time::timeout(FETCH_READ_TIMEOUT, FetchRequest::read(reader)).await {
-        Ok(result) => result?,
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => return answer_unreadable(writer, error).await,
         Err(_) => return Err(io::Error::other("fetch request read timed out")),
     };
     let served = fetch_and_stream(writer, &request, allow, limits).await;
@@ -150,6 +151,25 @@ where
     // EOF and can distinguish a complete response from a truncated one.
     let closed = writer.shutdown().await;
     served.and(closed)
+}
+
+/// Tell a requester whose frame this build cannot parse WHY, then close the write half so it reads a
+/// clean end instead of a stall.
+///
+/// Only a version mismatch has an answer: the identity already proved the peer speaks fetch, so naming
+/// both versions tells it what happened and what to do. A foreign or broken stream has nothing true it
+/// could be told and is returned as the failure it is. Disclosure is not a question here the way it is
+/// on a pre-gate wire: this frame is read INSIDE a stream the host already admitted, so the peer is
+/// authorized and the answer carries no host fact beyond a wire version any served request reveals.
+async fn answer_unreadable<W: io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    error: RequestReadError,
+) -> io::Result<()> {
+    let Some(answer) = error.answer() else {
+        return Err(error.into());
+    };
+    answer.write(writer).await?;
+    writer.shutdown().await
 }
 
 /// Perform the origin request and stream its response back, all under `limits`: the fetch and the body
