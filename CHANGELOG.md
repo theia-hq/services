@@ -2,6 +2,41 @@
 
 All notable changes to services, newest first.
 
+## v0.3.0
+
+Two wires learn to say which version they speak, and a ping stops hanging.
+
+### Fixed
+- **A peer one release out was indistinguishable from a foreign protocol, on both wires.** `measure`
+  and `fetch` each compared four magic bytes for equality and then propagated the mismatch before
+  any response could be written, so a dialer on another build received a closed stream and no
+  explanation at all.
+
+  Both now read the magic as an identity followed by a version, split by the rule the identity is
+  defined by, the maximal run of capitals. One rule parses both a two-and-two magic and a
+  three-and-one magic, which is why the two shapes were never two patterns. Each wire checks its own
+  magic against that rule at compile time, walking the run rather than naming byte positions, so
+  widening an identity later cannot leave a byte unchecked.
+
+  A foreign identity is still refused in silence, and the wording that always said so is now true.
+  A version mismatch is answered, naming what the peer sent and what this host speaks.
+
+- **`swoosh ping` and `swoosh status` hung forever against a peer that admitted the stream and then
+  went quiet.** A probe now waits ten seconds and a probe that times out counts as loss, which is
+  what loss has always meant to a person. The wait covers writing as well as reading, because a peer
+  that stops reading parks a client just as surely as one that stops answering.
+
+  The bound is not shared with the speed client's stall bound, which is a duration cap plus grace
+  for a sink that may honestly owe its count for its whole lifetime. Nothing holds a reply back, so
+  deriving this one the same way would have answered a hang with a slower hang.
+
+### Changed
+- Advances to bifrost v0.4.0, nauthy v0.4.0 and tightbeam v0.11.0.
+- **`fetch`'s response frame carries its own frozen tag**, no longer derived from the request
+  version. Its response carries the magic, unlike the other wires in the family, so an answer
+  written with a bumped version would be unreadable by exactly the peer it is for. No byte changes
+  today; a future version bump can no longer silently break the answer.
+
 ## v0.2.0
 
 Keeps up with a refusal type that stopped being a closed set.
