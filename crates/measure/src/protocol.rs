@@ -6,7 +6,12 @@
 //! counted byte stream flows in the chosen direction, then a framed reply reports the counted total.
 
 use bifrost::{RefusalDetail, RefusalDetailError};
+use tightbeam_handler::wire::{read_frame, write_frame};
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
+
+mod opening;
+
+pub use opening::{Opening, Unread};
 
 /// measure's protocol identity: the bytes every request frame opens with, at every version, forever. A
 /// stream that does not open with these is not a measure stream, and that is the only thing an identity
@@ -53,12 +58,21 @@ const fn all_between(bytes: &[u8], lo: u8, hi: u8) -> bool {
 pub struct WireVersion([u8; 2]);
 
 impl WireVersion {
-    /// Read the version half, after the identity. The width of the field lives here, in the type that
-    /// owns it, so the reader and the writer cannot drift apart.
-    async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
-        let mut bytes = [0u8; 2];
-        reader.read_exact(&mut bytes).await?;
-        Ok(Self(bytes))
+    /// The version half of a head, taken after the identity. The width of the field lives here, in the
+    /// type that owns it, so the codec and the writer cannot drift apart.
+    ///
+    /// `None` for a capital where the version begins, because that is the identity RUN continuing into
+    /// a longer name. An identity is the maximal leading run of capitals, so `DGX1` is identity `DGX`,
+    /// a different wire, and not this one at version `X1`. Without this the reader answers a foreign
+    /// protocol with this host's version, which is a fact it has no business handing out and a
+    /// diagnosis the peer cannot use. The check lives in the type that owns the field, so a version
+    /// cannot exist unless the run stopped before it.
+    fn after_identity(bytes: [u8; 2]) -> Option<Self> {
+        let [after_identity, ..] = bytes;
+        if after_identity.is_ascii_uppercase() {
+            return None;
+        }
+        Some(Self(bytes))
     }
 
     /// The bytes as they go on the wire.
@@ -209,77 +223,34 @@ impl Request {
     pub(crate) const PING_BYTES: u64 =
         (IDENTITY.len() + VERSION.as_bytes().len() + 1 + 4 + 8) as u64;
 
-    /// Write the framed request: identity, version, tag, then the variant's fields.
+    /// Write the framed request in ONE call: identity, version, tag, then the variant's fields.
+    ///
+    /// Byte for byte what the field-by-field writer emitted, and four calls became one. Every call is
+    /// an allocation and a copy, and on a transport that seals per write it is a whole frame of
+    /// overhead: a 17-byte ping frame paid 92 bytes of framing across four writes and pays 23 across
+    /// one, on the latency path of the family's own diagnostic.
     pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&IDENTITY).await?;
-        writer.write_all(VERSION.as_bytes()).await?;
-        match *self {
-            Request::Ping {
-                seq,
-                sent_unix_nanos,
-            } => {
-                writer.write_all(&[tag::PING]).await?;
-                writer.write_all(&seq.to_be_bytes()).await?;
-                writer.write_all(&sent_unix_nanos.to_be_bytes()).await
-            }
-            Request::SpeedSink { limit_bytes } => {
-                writer.write_all(&[tag::SPEED_SINK]).await?;
-                writer.write_all(&limit_bytes.to_be_bytes()).await
-            }
-            Request::SpeedSource { limit_bytes } => {
-                writer.write_all(&[tag::SPEED_SOURCE]).await?;
-                writer
-                    .write_all(&limit_bytes.unwrap_or(UNBOUNDED).to_be_bytes())
-                    .await
-            }
-            Request::SpeedBidir { limit_bytes } => {
-                writer.write_all(&[tag::SPEED_BIDIR]).await?;
-                writer
-                    .write_all(&limit_bytes.unwrap_or(UNBOUNDED).to_be_bytes())
-                    .await
-            }
-        }
+        write_frame(writer, &Opening::Spoken(*self))
+            .await
+            .map_err(opening::io_error)
     }
 
-    /// Read a framed request.
+    /// Read a framed request, failing with whatever the opening turned out to be instead.
     ///
     /// The magic is parsed as [`IDENTITY`] plus a [`WireVersion`], never compared as four bytes, so
     /// that "not our protocol" and "our protocol, another build" stay two facts instead of one. Only
     /// the second is something the peer can act on, and [`ProtocolError::answer`] is where it gets
     /// answered rather than logged at the wrong end.
+    ///
+    /// This is the door for a caller that wants the typed error it always got: the client's own
+    /// reader, and a responder that reads its own opening. A responder on the typed door takes an
+    /// [`Opening`] instead, because an unreadable head is a frame it may still have something true to
+    /// write back to.
     pub async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> Result<Self, ProtocolError> {
-        let mut identity = [0u8; IDENTITY.len()];
-        reader.read_exact(&mut identity).await?;
-        if identity != IDENTITY {
-            return Err(ProtocolError::Foreign);
-        }
-        let version = WireVersion::read(reader).await?;
-        if version != VERSION {
-            return Err(ProtocolError::Version { peer: version });
-        }
-        let mut tag = [0u8; 1];
-        reader.read_exact(&mut tag).await?;
-        match tag[0] {
-            tag::PING => Ok(Request::Ping {
-                seq: read_u32(reader).await?,
-                sent_unix_nanos: read_u64(reader).await?,
-            }),
-            tag::SPEED_SINK => Ok(Request::SpeedSink {
-                limit_bytes: read_u64(reader).await?,
-            }),
-            tag::SPEED_SOURCE => {
-                let limit_bytes = read_u64(reader).await?;
-                Ok(Request::SpeedSource {
-                    limit_bytes: (limit_bytes != UNBOUNDED).then_some(limit_bytes),
-                })
-            }
-            tag::SPEED_BIDIR => {
-                let limit_bytes = read_u64(reader).await?;
-                Ok(Request::SpeedBidir {
-                    limit_bytes: (limit_bytes != UNBOUNDED).then_some(limit_bytes),
-                })
-            }
-            other => Err(ProtocolError::UnknownRequest(other)),
+        match read_frame::<Opening, _>(reader).await {
+            Ok(Opening::Spoken(request)) => Ok(request),
+            Ok(Opening::Unread(unread)) => Err(unread.cause()),
+            Err(error) => Err(ProtocolError::from(error)),
         }
     }
 }

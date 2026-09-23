@@ -1,6 +1,31 @@
 # Changelog
 
-All notable changes to services, newest first.
+The four engines here share no code with each other, so each carries its own version and its own
+cadence: a release moves one engine and leaves the other three exactly where they were. Each
+engine's notes live beside its manifest.
+
+- [`fetch`](crates/fetch/CHANGELOG.md)
+- [`measure`](crates/measure/CHANGELOG.md)
+- [`sshh`](crates/sshh/CHANGELOG.md)
+- [`transfer`](crates/transfer/CHANGELOG.md)
+
+This file is the record of what came before, newest first, and it closes at v0.3.0. Up to and
+including that release the four moved together under one number, so every entry below is about the
+set: not one of them is about a single engine, which is why they stay here rather than being dealt
+out four ways.
+
+All four start from the v0.3.0 they hold today. That number was reached in lockstep rather than
+earned separately, and it stands. A version that shipped is shipped, and an untidy starting point
+is better than a rewritten history.
+
+What lockstep cost is easiest to see in `sshh`, which has had no source change at all since its
+first release and whose version was raised ten times anyway, 0.1.0 through 0.3.0. Ten releases of
+code that did not move. Read the other way, the same numbering meant a fix in one engine arrived
+as a new version of the other three, and a consumer comparing versions could not tell which.
+
+The repository itself has no version. Its root manifest is a workspace with no package to carry
+one, and the marker for the set that was tested together is the commit, which is what a consumer
+pins.
 
 ## v0.3.0
 

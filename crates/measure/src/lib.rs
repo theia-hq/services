@@ -12,6 +12,11 @@
 //! [`server::MeteredSpeed`] (public routes, the safety caps by construction), each behind its own gate
 //! and each refusing the other's method at the wire. A client constructs a [`Ping`] or [`Speedtest`],
 //! runs it against a session, and reads back a report.
+//!
+//! The owner entries are bound through the contract's typed adapter (`Serve(Ping::new(..))`), which
+//! decodes the [`protocol::Opening`] frame and hands the stream halves on by value; the metered entries
+//! are bound directly, because their wall clock has to cover the opening read. Either way the codec
+//! touches the preamble only, never a payload byte.
 
 pub mod ping;
 pub mod protocol;

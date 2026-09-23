@@ -199,3 +199,291 @@ fn a_stream_failure_does_not_claim_a_read() {
         "a client chaining the causes reads the failure and its detail, and nothing invented"
     );
 }
+
+/// The wire vectors `PROTOCOL.md` publishes.
+///
+/// Every octet in that document is produced HERE, by this crate's own codec, and the document is read
+/// back and compared. A specification whose vectors are typed by hand is a second implementation nobody
+/// runs; these cannot drift, because the wire moving turns the drift into a failing test.
+///
+/// To regenerate after a wire change, run the module and paste the printed blocks over the ones in the
+/// document:
+///
+/// ```text
+/// cargo test -p measure --lib protocol::protocol_tests::vectors -- --nocapture
+/// ```
+mod vectors {
+    use std::collections::BTreeMap;
+
+    use bifrost::RefusalDetail;
+
+    use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
+
+    /// The document under test, compiled in, so `cargo test` and the published specification cannot be
+    /// two different files.
+    const PROTOCOL_MD: &str = include_str!("../PROTOCOL.md");
+
+    /// The client-chosen nonce every ping vector carries. An opaque `u64` the responder echoes
+    /// untouched; a plausible unix-nanos stamp rather than a round number, so all eight octets differ
+    /// and a reimplementer reading the block cannot mistake a padded field for a short one.
+    const NONCE: u64 = 1_726_000_000_000_000_000;
+
+    /// One published vector: the label the document files it under, and the octets that belong under it.
+    struct Vector {
+        name: &'static str,
+        bytes: Vec<u8>,
+    }
+
+    /// Encode a request and prove the reader takes those exact octets back to the same value. A vector is
+    /// only a vector when both halves of the codec agree on it, so the round trip is part of building one
+    /// rather than a separate test that could be forgotten.
+    async fn request_vector(name: &'static str, request: Request) -> Vector {
+        let mut bytes = Vec::new();
+        request.write(&mut bytes).await.expect("a Vec never fails");
+        assert_eq!(
+            Request::read(&mut bytes.as_slice()).await.unwrap(),
+            request,
+            "{name} does not read back"
+        );
+        Vector { name, bytes }
+    }
+
+    /// The same for a response frame.
+    async fn response_vector(name: &'static str, response: Response) -> Vector {
+        let mut bytes = Vec::new();
+        response.write(&mut bytes).await.expect("a Vec never fails");
+        assert_eq!(
+            Response::read(&mut bytes.as_slice()).await.unwrap(),
+            response,
+            "{name} does not read back"
+        );
+        Vector { name, bytes }
+    }
+
+    /// A peer's opening octets, built by writing a well-formed ping request and overwriting the four
+    /// magic bytes with `magic`. Built rather than typed so the body after the magic is exactly the body
+    /// the ping vector carries, leaving the magic as the only difference under test.
+    async fn head_vector(name: &'static str, magic: &[u8; 4]) -> Vector {
+        let mut bytes = Vec::new();
+        ping().write(&mut bytes).await.expect("a Vec never fails");
+        bytes[..4].copy_from_slice(magic);
+        Vector { name, bytes }
+    }
+
+    /// The request every head vector carries after its magic, and the ping vector in its own right.
+    fn ping() -> Request {
+        Request::Ping {
+            seq: 7,
+            sent_unix_nanos: NONCE,
+        }
+    }
+
+    /// The frame a responder writes back to `head`, which is an answer exactly when the head named this
+    /// protocol's identity and a version the responder does not serve, and nothing at all otherwise.
+    async fn answer_to(mut head: &[u8]) -> Option<Response> {
+        Request::read(&mut head)
+            .await
+            .expect_err("every head here is one this build cannot read")
+            .answer()
+    }
+
+    /// Every vector the document publishes, in document order.
+    async fn published() -> Vec<Vector> {
+        let mismatch = head_vector("dg02-head-version-mismatch", b"DG03").await;
+        let foreign = head_vector("dg02-head-foreign", b"SSH-").await;
+        let longer = head_vector("dg02-head-longer-identity", b"DGX1").await;
+        assert!(
+            answer_to(&foreign.bytes).await.is_none(),
+            "a foreign identity gets no octets back"
+        );
+        // A head naming a LONGER identity that merely opens with `DG` is a different wire, not this
+        // one at an unserved version, and it gets the silence any foreign wire gets. The run-end
+        // check in `WireVersion::read` is the only thing holding that, since two of the family's
+        // identities already share a prefix; reverting it turns this red and the reader starts
+        // handing this host's version to protocols it does not speak.
+        assert!(
+            answer_to(&longer.bytes).await.is_none(),
+            "a longer identity that opens with ours is foreign, and gets no octets either"
+        );
+        let mismatch_answer = answer_to(&mismatch.bytes)
+            .await
+            .expect("a served identity on an unserved version is answered");
+        vec![
+            request_vector("dg02-request-ping", ping()).await,
+            request_vector(
+                "dg02-request-speed-sink",
+                Request::SpeedSink {
+                    limit_bytes: 8 * 1024 * 1024,
+                },
+            )
+            .await,
+            request_vector(
+                "dg02-request-speed-sink-no-exact-count",
+                Request::SpeedSink {
+                    limit_bytes: crate::protocol::UNBOUNDED,
+                },
+            )
+            .await,
+            request_vector(
+                "dg02-request-speed-source",
+                Request::SpeedSource {
+                    limit_bytes: Some(4 * 1024 * 1024),
+                },
+            )
+            .await,
+            request_vector(
+                "dg02-request-speed-source-unbounded",
+                Request::SpeedSource { limit_bytes: None },
+            )
+            .await,
+            request_vector(
+                "dg02-request-speed-bidir",
+                Request::SpeedBidir {
+                    limit_bytes: Some(2 * 1024 * 1024),
+                },
+            )
+            .await,
+            response_vector(
+                "dg02-response-pong",
+                Response::Pong {
+                    seq: 7,
+                    sent_unix_nanos: NONCE,
+                },
+            )
+            .await,
+            response_vector(
+                "dg02-response-received",
+                Response::Received {
+                    bytes: 8 * 1024 * 1024,
+                },
+            )
+            .await,
+            response_vector("dg02-response-sourcing", Response::Sourcing).await,
+            // The three refusal details are the responder's own prose, restated here because each lives
+            // as a literal at the site that writes it. The vector fixes the FRAMING; a client never
+            // parses the text.
+            response_vector(
+                "dg02-response-unsupported-wrong-method",
+                Response::Unsupported {
+                    code: MethodRefusal::WrongMethod,
+                    detail: RefusalDetail::bounded("this node serves ping, not speed"),
+                },
+            )
+            .await,
+            response_vector(
+                "dg02-response-unsupported-rate-limited",
+                Response::Unsupported {
+                    code: MethodRefusal::RateLimited,
+                    detail: RefusalDetail::bounded(
+                        "speed request is over the byte cap, request fewer bytes",
+                    ),
+                },
+            )
+            .await,
+            response_vector(
+                "dg02-response-unsupported-busy",
+                Response::Unsupported {
+                    code: MethodRefusal::Busy,
+                    detail: RefusalDetail::bounded("speed busy, try again shortly"),
+                },
+            )
+            .await,
+            mismatch,
+            response_vector("dg02-response-version-mismatch", mismatch_answer).await,
+            foreign,
+            longer,
+        ]
+    }
+
+    /// The octets as one unbroken lowercase hex string: the form the document is compared in, so the
+    /// grouping and line breaks a reader sees are presentation and nothing more.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The octets as the document shows them: lowercase pairs, sixteen to a line, so a regenerated block
+    /// pastes in unedited.
+    fn octet_lines(bytes: &[u8]) -> String {
+        bytes
+            .chunks(16)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The vectors the document publishes, parsed out of it: a block opens with a `vector <name>` line,
+    /// and the octet lines under it, to the next blank line or fence, are the frame. Reading the document
+    /// rather than restating it is what makes a divergence a test failure instead of a discovery.
+    fn documented() -> BTreeMap<String, String> {
+        let mut found = BTreeMap::new();
+        let mut lines = PROTOCOL_MD.lines();
+        while let Some(line) = lines.next() {
+            let Some(name) = line.trim().strip_prefix("vector ") else {
+                continue;
+            };
+            let mut octets = String::new();
+            for line in lines.by_ref() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("```") {
+                    break;
+                }
+                octets.extend(line.chars().filter(|char| !char.is_whitespace()));
+            }
+            assert!(
+                found.insert(name.trim().to_owned(), octets).is_none(),
+                "{name} is published twice"
+            );
+        }
+        found
+    }
+
+    /// Every octet the document publishes is an octet this codec writes, and every vector it names is one
+    /// the codec still produces. Both directions: a stale vector and an orphaned one are the same defect.
+    #[tokio::test]
+    async fn the_document_publishes_exactly_what_this_codec_writes() {
+        let mut documented = documented();
+        let mut wrong = Vec::new();
+        for Vector { name, bytes } in published().await {
+            // Printed unconditionally: this is the regeneration output, and a run with --nocapture is
+            // how the document is rewritten after the wire moves.
+            println!("vector {name}\n{}\n", octet_lines(&bytes));
+            let expected = hex(&bytes);
+            match documented.remove(name) {
+                Some(published) if published == expected => {}
+                Some(published) => {
+                    wrong.push(format!("{name}: published {published}, wire {expected}"))
+                }
+                None => wrong.push(format!("{name}: not published; wire {expected}")),
+            }
+        }
+        for orphan in documented.keys() {
+            wrong.push(format!(
+                "{orphan}: published, but this codec writes no such frame"
+            ));
+        }
+        assert!(
+            wrong.is_empty(),
+            "PROTOCOL.md is out of date:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// `ProtocolError` is only here so the answer helper can name the error it expects; the assertion
+    /// that it is the version arm keeps the head vectors honest about which condition they provoke.
+    #[tokio::test]
+    async fn the_version_head_provokes_the_version_condition() {
+        let mut head = Vec::new();
+        ping().write(&mut head).await.expect("a Vec never fails");
+        head[..4].copy_from_slice(b"DG03");
+        assert!(matches!(
+            Request::read(&mut head.as_slice()).await,
+            Err(ProtocolError::Version { .. })
+        ));
+    }
+}
