@@ -12,10 +12,13 @@
 use core::time::Duration;
 
 use bifrost::RefusalDetail;
+use tightbeam_handler::wire::read_frame;
 use tokio::{io, time};
 
 use crate::payload::Payload;
-use crate::protocol::{MethodRefusal, ProtocolError, Request, Response, UNBOUNDED};
+use crate::protocol::{
+    MethodRefusal, Opening, ProtocolError, Request, Response, UNBOUNDED, Unread,
+};
 
 /// The responder-side bounds [`crate::server::Speed`] enforces on one speed stream: the largest payload it
 /// will move per direction and the longest it will run. `None` on either is unbounded: that is the owner
@@ -104,28 +107,53 @@ where
     R: io::AsyncRead + Unpin,
 {
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
-    let Some(opening) = read_opening(&mut writer, &mut reader, deadline).await? else {
+    let Some(opening) = read_opening(&mut reader, deadline).await? else {
         // The cap fired before a probe arrived; nothing was served, so the stream just closes.
         return Ok(());
     };
-    match opening {
+    ping_body(&mut writer, &mut reader, opening, caps, deadline).await
+}
+
+/// Answer one inbound stream on the `ping` service whose opening frame HAS ALREADY BEEN READ: the
+/// typed door, where the contract's adapter decodes the preamble and hands back the raw halves.
+///
+/// The same body as [`answer_ping`] from the frame onward, so the two doors cannot drift. What differs
+/// is only where the clock starts, and it has to: this one is entered with the frame already in hand,
+/// so its cap runs from here rather than from the opening read, which the caller no longer performs.
+pub(crate) async fn respond_ping<W, R>(
+    opening: Opening,
+    mut writer: W,
+    mut reader: R,
+    caps: PingCaps,
+) -> Result<(), ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
+    ping_body(&mut writer, &mut reader, opening, caps, deadline).await
+}
+
+/// Everything a ping stream does once its opening frame exists, shared by both doors.
+async fn ping_body<W, R>(
+    writer: &mut W,
+    reader: &mut R,
+    opening: Opening,
+    caps: PingCaps,
+    deadline: Option<time::Instant>,
+) -> Result<(), ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    match spoken(writer, opening).await? {
         Request::Ping {
             seq,
             sent_unix_nanos,
-        } => {
-            echo_pings(
-                &mut writer,
-                &mut reader,
-                seq,
-                sent_unix_nanos,
-                caps,
-                deadline,
-            )
-            .await
-        }
+        } => echo_pings(writer, reader, seq, sent_unix_nanos, caps, deadline).await,
         _ => {
             refuse(
-                &mut writer,
+                writer,
                 MethodRefusal::WrongMethod,
                 "this node serves ping, not speed",
             )
@@ -155,52 +183,99 @@ where
     // One deadline for the whole stream: the request read and the transfer share the cap, so a caller
     // that stalls before naming a method is bounded too, never parked open until the client stops.
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
-    let Some(request) = read_opening(&mut writer, &mut reader, deadline).await? else {
+    let Some(opening) = read_opening(&mut reader, deadline).await? else {
         // The cap fired before a method arrived; close cleanly, nothing was served.
         return Ok(());
     };
-    match request {
+    speed_body(&mut writer, &mut reader, opening, caps, deadline).await
+}
+
+/// Answer one inbound stream on the `speed` service whose opening frame HAS ALREADY BEEN READ: the
+/// typed door, as [`respond_ping`] is for liveness. The payload phase is untouched by the framing,
+/// because the adapter hands the raw halves back by value: the codec never sees a payload byte, which
+/// is what keeps a measured transfer measuring the transport rather than a copy.
+pub(crate) async fn respond_speed<W, R>(
+    opening: Opening,
+    mut writer: W,
+    mut reader: R,
+    caps: SpeedCaps,
+) -> Result<(), ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
+    speed_body(&mut writer, &mut reader, opening, caps, deadline).await
+}
+
+/// Everything a speed stream does once its opening frame exists, shared by both doors.
+async fn speed_body<W, R>(
+    writer: &mut W,
+    reader: &mut R,
+    opening: Opening,
+    caps: SpeedCaps,
+    deadline: Option<time::Instant>,
+) -> Result<(), ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    match spoken(writer, opening).await? {
         Request::Ping { .. } => {
             refuse(
-                &mut writer,
+                writer,
                 MethodRefusal::WrongMethod,
                 "this node serves speed, not ping",
             )
             .await
         }
-        speed => serve_speed(&mut writer, &mut reader, speed, caps, deadline).await,
+        speed => serve_speed(writer, reader, speed, caps, deadline).await,
     }
 }
 
-/// Read a stream's opening request under `deadline`, telling a peer this build cannot parse WHY before
-/// the stream ends. `None` means the deadline fired before any frame arrived: nothing was served, so
-/// the caller closes cleanly.
+/// Read a stream's opening frame under `deadline`. `None` means the deadline fired before any frame
+/// arrived: nothing was served, so the caller closes cleanly.
 ///
-/// The one place a stream's first frame is read, so the answer cannot be written on one method and
-/// forgotten on the other. A peer on another wire version gets a typed refusal frame naming both
-/// versions, because a wire break between two builds of one tool is a fact the person at the keyboard
-/// can act on and a closed stream is not. A foreign or broken stream has nothing true it could be
-/// told, so it ends exactly as it always did. Either way the error is returned, so the host logs why.
-async fn read_opening<W, R>(
-    writer: &mut W,
+/// It reads and nothing else. A head this build cannot parse comes back as an [`Opening::Unread`]
+/// VALUE rather than an error, so the one place that decides what to say about it is [`spoken`], which
+/// both doors and both methods go through. That is what stops an answer being written on one path and
+/// forgotten on another, which is how a version-skewed peer used to get a bare closed stream.
+async fn read_opening<R>(
     reader: &mut R,
     deadline: Option<time::Instant>,
-) -> Result<Option<Request>, ProtocolError>
+) -> Result<Option<Opening>, ProtocolError>
 where
-    W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
     let read = match deadline {
-        Some(deadline) => match time::timeout_at(deadline, Request::read(reader)).await {
-            Ok(read) => read,
-            Err(_past_deadline) => return Ok(None),
-        },
-        None => Request::read(reader).await,
+        Some(deadline) => {
+            match time::timeout_at(deadline, read_frame::<Opening, _>(reader)).await {
+                Ok(read) => read,
+                Err(_past_deadline) => return Ok(None),
+            }
+        }
+        None => read_frame::<Opening, _>(reader).await,
     };
-    let error = match read {
-        Ok(request) => return Ok(Some(request)),
-        Err(error) => error,
+    read.map(Some).map_err(ProtocolError::from)
+}
+
+/// Peel an opening down to the request this build can serve, telling a peer this build cannot parse
+/// WHY before the stream ends.
+///
+/// The ONE place an unreadable head is dispositioned. A peer on another wire version gets a typed
+/// refusal frame naming both versions, because a wire break between two builds of one tool is a fact
+/// the person at the keyboard can act on and a closed stream is not. A foreign or broken stream has
+/// nothing true it could be told, so it ends exactly as it always did. Either way the error is
+/// returned, so the host logs why.
+async fn spoken<W>(writer: &mut W, opening: Opening) -> Result<Request, ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+{
+    let unread: Unread = match opening {
+        Opening::Spoken(request) => return Ok(request),
+        Opening::Unread(unread) => unread,
     };
+    let error = unread.cause();
     let Some(answer) = error.answer() else {
         return Err(error);
     };

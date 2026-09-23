@@ -5,6 +5,15 @@
 //! bodies stay in [`crate::responder`]; these impls are the entries and they apply the responder-side
 //! bounds from [`Limits`], the engine's two named profiles.
 //!
+//! Two DOORS, and which one an engine takes is a property of the engine, not of the contract. The owner
+//! engines take the TYPED door: they declare the opening frame and the adapter decodes it, handing the
+//! raw halves back by value so the echo loop and the payload drain are untouched. The metered engines
+//! stay on the raw floor, and the reason is a bound rather than a preference: their profile's wall clock
+//! covers the OPENING READ, and a public route needs it to, since a caller that opens a stream and then
+//! dribbles one byte holds a scarce public slot for as long as it likes. The adapter reads that frame
+//! and has no clock of its own, so the engine that must bound the read still performs it. Both doors run
+//! the same body from the frame onward, so nothing about the diagnostic differs between them.
+//!
 //! Metering is exposure-coupled, and the coupling is enforced by TYPES, never by assembly convention. Each
 //! service ships two engines: the owner engine ([`Ping`] / [`Speed`], `Exposure = Never`), a family route
 //! bound at [`Limits::owner`] (effectively unbounded) that can never face an open gate; and the metered
@@ -20,10 +29,10 @@ use std::time::Instant;
 
 use nauthy::VerifyKey;
 use tightbeam_handler::open_policy::{Never, OptIn, PublicUse};
-use tightbeam_handler::{BoxRead, BoxWrite, Handler, Metering, ServeError, Served};
+use tightbeam_handler::{BoxRead, BoxWrite, Handler, Metering, Serve, ServeError, Served, Service};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-use crate::protocol::MethodRefusal;
+use crate::protocol::{MethodRefusal, Opening};
 use crate::responder::{self, PingCaps, SpeedCaps};
 
 /// The minimum spacing between two ping RUNS (one admitted stream each) from one caller under the metered
@@ -179,8 +188,9 @@ impl Ping {
         true
     }
 
-    /// The whole per-stream body, given the admitted peer: refuse an over-rate caller, else echo the run
-    /// under this engine's caps. Shared with [`MeteredPing`], so the two engines cannot drift.
+    /// The whole per-stream body for the RAW door, given the admitted peer: refuse an over-rate
+    /// caller, else read this stream's opening frame and echo the run under this engine's caps.
+    /// [`MeteredPing`] serves through here, so the two engines cannot drift.
     async fn serve_peer(
         &self,
         peer: VerifyKey,
@@ -188,24 +198,55 @@ impl Ping {
         reader: BoxRead,
     ) -> Result<(), ServeError> {
         if !self.admits(peer) {
-            return responder::refuse(
-                &mut writer,
-                MethodRefusal::RateLimited,
-                "ping rate limited, try again shortly",
-            )
-            .await
-            .map_err(contract_error);
+            return self.refuse_rate(&mut writer).await;
         }
         responder::answer_ping(writer, reader, self.caps)
             .await
             .map_err(contract_error)
     }
+
+    /// The same body for the TYPED door, entered with the opening frame already decoded: the contract's
+    /// adapter read the preamble and handed the raw halves back by value, so the echo loop reads its
+    /// next probe off the same stream with nothing replayed into it.
+    async fn respond_peer(
+        &self,
+        peer: VerifyKey,
+        opening: Opening,
+        mut writer: BoxWrite,
+        reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        if !self.admits(peer) {
+            return self.refuse_rate(&mut writer).await;
+        }
+        responder::respond_ping(opening, writer, reader, self.caps)
+            .await
+            .map_err(contract_error)
+    }
+
+    /// Refuse an over-rate caller LOUDLY: the typed frame goes on the wire, so the client reads a
+    /// refusal rather than a silent close it would fold into loss. One place, so the two doors cannot
+    /// space one caller's runs differently.
+    async fn refuse_rate(&self, writer: &mut BoxWrite) -> Result<(), ServeError> {
+        responder::refuse(
+            writer,
+            MethodRefusal::RateLimited,
+            "ping rate limited, try again shortly",
+        )
+        .await
+        .map_err(contract_error)
+    }
 }
 
-impl Handler for Ping {
+impl Service for Ping {
     /// NEVER: an owner-limit engine is effectively unbounded, so it must not face an open gate. A ping
     /// route an operator wants open binds [`MeteredPing`] instead, which is capped by construction.
+    /// The adapter forwards this ceiling as a type, so the sealed choice stays this engine's.
     type Exposure = Never;
+
+    /// The opening frame of a diagnostic stream, decoded by the adapter before this engine runs. It
+    /// carries an unreadable head as a VALUE, so a version-skewed peer is still answered on the wire
+    /// by the body rather than dropped by the reader.
+    type Request = Opening;
 
     /// What this engine's profile actually applies, so a banner narrates the running policy, never a
     /// frozen flag.
@@ -217,13 +258,15 @@ impl Handler for Ping {
         }
     }
 
-    async fn serve(
+    async fn respond(
         &self,
-        served: Served<Self>,
+        served: Served<Serve<Self>>,
+        request: Opening,
         writer: BoxWrite,
         reader: BoxRead,
     ) -> Result<(), ServeError> {
-        self.serve_peer(served.peer(), writer, reader).await
+        self.respond_peer(served.peer(), request, writer, reader)
+            .await
     }
 }
 
@@ -301,31 +344,62 @@ impl Speed {
         }
     }
 
-    /// The whole per-stream body: take the slot, then run the transfer under this engine's caps. Shared
-    /// with [`MeteredSpeed`], so the two engines cannot drift.
+    /// The whole per-stream body for the RAW door: take the slot, read this stream's opening frame,
+    /// then run the transfer under this engine's caps. [`MeteredSpeed`] serves through here, so the
+    /// two engines cannot drift.
     async fn serve_stream(&self, mut writer: BoxWrite, reader: BoxRead) -> Result<(), ServeError> {
-        let _permit = match self.acquire_slot() {
-            Ok(permit) => permit,
-            Err(()) => {
-                return responder::refuse(
-                    &mut writer,
-                    MethodRefusal::Busy,
-                    "speed busy, try again shortly",
-                )
-                .await
-                .map_err(contract_error);
-            }
+        let Some(_permit) = self.take_slot(&mut writer).await? else {
+            return Ok(());
         };
         responder::answer_speed(writer, reader, self.caps)
             .await
             .map_err(contract_error)
     }
+
+    /// The same body for the TYPED door, entered with the opening frame already decoded. The PAYLOAD
+    /// is untouched by any of this: the adapter hands back the raw halves by value, so a counted
+    /// transfer still measures the transport rather than a copy through a codec.
+    async fn respond_stream(
+        &self,
+        opening: Opening,
+        mut writer: BoxWrite,
+        reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        let Some(_permit) = self.take_slot(&mut writer).await? else {
+            return Ok(());
+        };
+        responder::respond_speed(opening, writer, reader, self.caps)
+            .await
+            .map_err(contract_error)
+    }
+
+    /// Hold the transfer slot for this run, or refuse busy on the wire and end the stream. `None` is
+    /// the refusal, already written as a typed frame: a second concurrent caller is told, never queued
+    /// or given a share of the uplink. One place, so the two doors cannot admit different traffic.
+    async fn take_slot(
+        &self,
+        writer: &mut BoxWrite,
+    ) -> Result<Option<Option<SemaphorePermit<'_>>>, ServeError> {
+        match self.acquire_slot() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(()) => {
+                responder::refuse(writer, MethodRefusal::Busy, "speed busy, try again shortly")
+                    .await
+                    .map_err(contract_error)?;
+                Ok(None)
+            }
+        }
+    }
 }
 
-impl Handler for Speed {
+impl Service for Speed {
     /// NEVER: an owner-limit engine is effectively unbounded, so it must not face an open gate. A speed
     /// route an operator wants open binds [`MeteredSpeed`] instead, which is capped by construction.
+    /// The adapter forwards this ceiling as a type, so the sealed choice stays this engine's.
     type Exposure = Never;
+
+    /// The opening frame of a diagnostic stream, decoded by the adapter before this engine runs.
+    type Request = Opening;
 
     /// What this engine's profile actually applies, so a banner narrates the running policy, never a
     /// frozen flag.
@@ -337,13 +411,14 @@ impl Handler for Speed {
         }
     }
 
-    async fn serve(
+    async fn respond(
         &self,
-        _served: Served<Self>,
+        _served: Served<Serve<Self>>,
+        request: Opening,
         writer: BoxWrite,
         reader: BoxRead,
     ) -> Result<(), ServeError> {
-        self.serve_stream(writer, reader).await
+        self.respond_stream(request, writer, reader).await
     }
 }
 
@@ -401,12 +476,14 @@ fn contract_error(error: impl core::error::Error + Send + Sync + 'static) -> Ser
 /// engines an operator may deliberately open.
 const _: () = assert!(<<MeteredPing as Handler>::Exposure as PublicUse>::OPEN_SAFE);
 const _: () = assert!(<<MeteredSpeed as Handler>::Exposure as PublicUse>::OPEN_SAFE);
-const _: () = assert!(!<<Ping as Handler>::Exposure as PublicUse>::OPEN_SAFE);
-const _: () = assert!(!<<Speed as Handler>::Exposure as PublicUse>::OPEN_SAFE);
+const _: () = assert!(!<<Serve<Ping> as Handler>::Exposure as PublicUse>::OPEN_SAFE);
+const _: () = assert!(!<<Serve<Speed> as Handler>::Exposure as PublicUse>::OPEN_SAFE);
 
 #[cfg(test)]
 mod server_tests {
-    use tightbeam_handler::{Handler as _, Metering};
+    // `Service` as well as `Handler`, because the owner engines declare their metering on the typed
+    // door now: the assertions below are unchanged, only the trait the call resolves through.
+    use tightbeam_handler::{Handler as _, Metering, Service as _};
 
     use super::{
         Limits, MeteredPing, MeteredSpeed, PING_MAP_MAX, PING_MAX_BYTES, PING_MAX_DURATION, Ping,
@@ -617,5 +694,177 @@ mod server_tests {
             Limits::metered().speed_caps().max_duration,
             Some(SPEED_MAX_DURATION)
         );
+    }
+
+    /// A typed engine and a raw one, from THIS crate, in one erased route table. That is the property
+    /// that makes the typed door opt-in rather than a migration: the owner engines took it and the
+    /// public ones did not, and a dispatcher reads both ceilings without naming either trait.
+    ///
+    /// These live in their own module because naming the dispatcher's view alongside the tests above
+    /// would make `metering` ambiguous for every one of them, and they read it through the door the
+    /// engine declares it on.
+    mod typed_door {
+        use core::time::Duration;
+        use std::sync::Arc;
+
+        use tightbeam_handler::bridge::ErasedHandler;
+        use tightbeam_handler::{Metering, Serve};
+        use tokio::io::{self, AsyncWriteExt as _};
+
+        use super::super::{Limits, MeteredPing, MeteredSpeed, Ping, Speed};
+        use crate::protocol::{MethodRefusal, Request, Response};
+
+        /// A rooted admission witness, the only kind an owner engine's `Never` ceiling admits. Minted
+        /// through the gate, the same mint a dispatcher uses, so these drive the real serving path.
+        fn witness() -> nauthy::Admitted {
+            let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+            let peer = nauthy::Identity::from_secret(&[5u8; 32])
+                .expect("valid secret")
+                .verifying_key();
+            let service: nauthy::Service = "ping".parse().expect("valid service name");
+            let badge = signet
+                .mint_member(peer, nauthy::Request::expires_in(Duration::from_secs(300)))
+                .expect("mint a member badge");
+            nauthy::Gate::rooted(
+                signet.verifying_key(),
+                nauthy::FileDenylist::empty(std::env::temp_dir().join("measure-typed-door")),
+            )
+            .admit_witnessed(
+                nauthy::ProvenPeer::from_handshake(peer),
+                Some(&badge),
+                &service,
+            )
+            .expect("a member badge admits")
+        }
+
+        /// One well-formed frame, written by this build's own codec, with `at` replaced.
+        async fn frame_with(request: Request, at: usize, byte: u8) -> Vec<u8> {
+            let mut frame = Vec::new();
+            request
+                .write(&mut frame)
+                .await
+                .expect("a request frame fits a vec");
+            frame[at] = byte;
+            frame
+        }
+
+        #[test]
+        fn the_typed_and_raw_engines_share_one_erased_store() {
+            let store: Vec<Arc<dyn ErasedHandler>> = vec![
+                Arc::new(Serve(Ping::new(&Limits::owner()))),
+                Arc::new(MeteredPing::new()),
+                Arc::new(Serve(Speed::new(&Limits::owner()))),
+                Arc::new(MeteredSpeed::new()),
+            ];
+            assert!(
+                !store[0].open_safe() && !store[2].open_safe(),
+                "the owner engines are unopenable through the adapter, as they were through the floor"
+            );
+            assert!(
+                store[1].open_safe() && store[3].open_safe(),
+                "and the metered engines are still the openable ones"
+            );
+            assert_eq!(store[1].metering(), Metering::Metered);
+            assert_eq!(
+                store[0].metering(),
+                Metering::Unmetered,
+                "the engine's own metering rides through the adapter, never a frozen flag"
+            );
+        }
+
+        /// A peer on another wire version is ANSWERED through the TYPED door, not dropped by the reader
+        /// that decoded its frame. The adapter reads the preamble, so this is the property most at risk
+        /// from the conversion: a codec that failed on an unreadable head would take the one sentence
+        /// this wire can say back and turn it into a bare closed stream.
+        ///
+        /// Make the skewed head a decode failure instead of an `Opening::Unread` value and this goes red
+        /// waiting for a frame that never comes.
+        #[tokio::test]
+        async fn a_version_skewed_peer_is_answered_through_the_typed_door() {
+            let frame = frame_with(
+                Request::Ping {
+                    seq: 1,
+                    sent_unix_nanos: 2,
+                },
+                3,
+                b'3',
+            )
+            .await;
+
+            let ping = Serve(Ping::new(&Limits::owner()));
+            let prepared = ping
+                .prepare(witness())
+                .expect("a rooted witness mints an owner engine's proof");
+            let (mut client, server) = io::duplex(1024);
+            let (server_read, server_write) = io::split(server);
+            let (served, answer) = tokio::join!(
+                prepared.serve(Box::new(server_write), Box::new(server_read)),
+                async {
+                    client
+                        .write_all(&frame)
+                        .await
+                        .expect("the frame fits the stream");
+                    Response::read(&mut client).await
+                }
+            );
+
+            let answer = answer.expect("the version answer is a frame, not an EOF");
+            let Response::Unsupported { code, detail } = answer else {
+                panic!("a frame this build cannot parse is refused, never served: {answer:?}");
+            };
+            assert_eq!(code, MethodRefusal::WrongMethod);
+            assert!(
+                detail.as_str().contains("DG03") && detail.as_str().contains("DG02"),
+                "{detail}"
+            );
+            assert!(
+                served.is_err(),
+                "the host still fails the stream and logs why"
+            );
+        }
+
+        /// The PAYLOAD comes back raw. The adapter frames the opening and hands the stream halves on by
+        /// value, so a counted upload reaches the drain whole, positioned at its first byte, with nothing
+        /// stranded inside a codec and nothing copied through one. A buffering reader would strand the
+        /// payload bytes it read past the frame and the count would come back short.
+        #[tokio::test]
+        async fn the_typed_door_hands_the_payload_back_raw() {
+            const PAYLOAD: u64 = 4096;
+            let mut frame = Vec::new();
+            Request::SpeedSink {
+                limit_bytes: PAYLOAD,
+            }
+            .write(&mut frame)
+            .await
+            .expect("a request frame fits a vec");
+
+            let speed = Serve(Speed::new(&Limits::owner()));
+            let prepared = speed
+                .prepare(witness())
+                .expect("a rooted witness mints an owner engine's proof");
+            let (mut client, server) = io::duplex(1024);
+            let (server_read, server_write) = io::split(server);
+            let (served, reply) = tokio::join!(
+                prepared.serve(Box::new(server_write), Box::new(server_read)),
+                async {
+                    client
+                        .write_all(&frame)
+                        .await
+                        .expect("the frame fits the stream");
+                    client
+                        .write_all(&vec![0xab; PAYLOAD as usize])
+                        .await
+                        .expect("the payload fits the stream");
+                    Response::read(&mut client).await
+                }
+            );
+
+            served.expect("the typed engine serves the transfer");
+            assert_eq!(
+                reply.expect("the count frame arrives"),
+                Response::Received { bytes: PAYLOAD },
+                "every payload byte reached the drain through the raw half"
+            );
+        }
     }
 }
