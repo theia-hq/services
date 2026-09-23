@@ -3,6 +3,11 @@
 All notable changes to `measure`, newest first. It carries its own version and its own cadence, so a
 release here moves `measure` and nothing else in this repository.
 
+## Unreleased
+
+### Changed
+- Builds against tightbeam v0.14.1's handler contract. The contract itself is unchanged.
+
 ## v0.4.0
 
 ### Breaking
