@@ -3,6 +3,16 @@
 All notable changes to `transfer`, newest first. It carries its own version and its own cadence, so a
 release here moves `transfer` and nothing else in this repository.
 
+## Unreleased
+
+### Changed
+- **`Recv` no longer logs a received file; it hands it to you.** Build it with
+  `Recv::new(out).with_sink(sink)` and each landed file reaches your `ReceivedSink` as a `Received` value,
+  once, after it is in place. The path is the sender's name, so escape it before printing it. A sink must
+  not block. Without a sink the engine prints nothing.
+- **A path in an error message also escapes letters that print as blank space**, so a name made only of
+  them is never invisible in a log.
+
 Nothing before v0.3.0 is recorded here. Until then the four engines released together under one
 number, and those entries are about the set rather than about any one engine, so they stay in the
 [repository changelog](../../CHANGELOG.md). `transfer` starts from the v0.3.0 it holds today, reached

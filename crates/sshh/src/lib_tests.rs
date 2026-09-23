@@ -74,3 +74,144 @@ fn shell_slots_are_capped_and_released() {
         "every slot released"
     );
 }
+
+/// A shell in a real pty, running `script`, with its pid, the two splice halves, and the far end of
+/// each, which the caller holds open so nothing but the shell itself or a hangup can end the attendance.
+struct Fixture {
+    pty: pty_process::Pty,
+    child: tokio::process::Child,
+    pid: u32,
+    writer: io::DuplexStream,
+    reader: io::DuplexStream,
+    _far: (io::DuplexStream, io::DuplexStream),
+}
+
+fn shell(script: &str) -> Fixture {
+    let (pty, pts) = pty_process::open().expect("open a pty");
+    pty.resize(Size::new(24, 80)).expect("size the pty");
+    let child = default_signals(Command::new("/bin/sh").arg("-c").arg(script))
+        .spawn(pts)
+        .expect("spawn the shell");
+    let pid = child.id().expect("a running child has a pid");
+    let (writer, client_reads) = io::duplex(1024);
+    let (client_writes, reader) = io::duplex(1024);
+    Fixture {
+        pty,
+        child,
+        pid,
+        writer,
+        reader,
+        _far: (client_reads, client_writes),
+    }
+}
+
+/// Whether `pid` still names a live process (a zombie counts as gone: it has exited).
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 only probes whether the pid exists and may be signalled.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[tokio::test]
+async fn a_shell_whose_connection_ends_is_hung_up_and_reaped() {
+    // The connection outlives nothing: once its sender drops, the pty closes under the shell and the
+    // shell exits, rather than running on with no one attached.
+    let Fixture {
+        pty,
+        child,
+        pid,
+        writer,
+        reader,
+        _far,
+    } = shell("exec sleep 1000");
+    let (connection, hangup) = watch::channel(());
+    let (_resize, resize_rx) = watch::channel(Size::new(24, 80));
+    let attending = tokio::spawn(attend(pty, child, writer, reader, resize_rx, hangup));
+    tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+    assert!(alive(pid), "the shell runs while its connection lives");
+
+    drop(connection);
+    let attended = tokio::time::timeout(core::time::Duration::from_secs(5), attending)
+        .await
+        .expect("a hung-up shell must exit, not outlive its connection")
+        .expect("the attendance task joins");
+    assert_eq!(attended, Attended::HungUp);
+    assert!(!alive(pid), "the shell is gone and reaped");
+}
+
+#[tokio::test]
+async fn a_shell_that_exits_first_reports_its_code() {
+    let Fixture {
+        pty,
+        child,
+        writer,
+        reader,
+        _far: (_client_reads, client_writes),
+        ..
+    } = shell("exit 3");
+    // The client has nothing more to send, so the splice's input side ends and only the shell is left.
+    drop(client_writes);
+    let (_connection, hangup) = watch::channel(());
+    let (_resize, resize_rx) = watch::channel(Size::new(24, 80));
+    let attended = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        attend(pty, child, writer, reader, resize_rx, hangup),
+    )
+    .await
+    .expect("a shell that exits ends its attendance");
+    assert_eq!(attended, Attended::Exited(3), "the client is owed the code");
+}
+
+/// Hang up `script`'s shell and return how long it took to be gone, asserting it is gone.
+async fn hang_up(script: &str) -> core::time::Duration {
+    let Fixture {
+        pty,
+        child,
+        pid,
+        writer,
+        reader,
+        _far,
+    } = shell(script);
+    let (connection, hangup) = watch::channel(());
+    let (_resize, resize_rx) = watch::channel(Size::new(24, 80));
+    let attending = tokio::spawn(attend(pty, child, writer, reader, resize_rx, hangup));
+    tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+    assert!(alive(pid), "the shell runs while its connection lives");
+    let started = std::time::Instant::now();
+    drop(connection);
+    let attended = tokio::time::timeout(HANGUP_GRACE * 3, attending)
+        .await
+        .expect("a hung-up shell must be gone within the grace, not outlive its connection")
+        .expect("the attendance task joins");
+    assert_eq!(attended, Attended::HungUp);
+    assert!(!alive(pid), "the shell is gone and reaped");
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn a_shell_that_ignores_the_hangup_is_killed_after_the_grace() {
+    // The shell ignores SIGHUP and execs into a sleep that inherits it: only the kill ends it.
+    let took = hang_up("trap '' HUP; exec sleep 1000").await;
+    assert!(
+        took >= HANGUP_GRACE,
+        "killed after the grace, not before: {took:?}"
+    );
+}
+
+#[test]
+fn a_shell_spawned_by_a_process_ignoring_the_hangup_still_hears_it() {
+    // A serve under `nohup` ignores SIGHUP, and an ignored disposition survives `exec`. The shell must
+    // start with it at its default, so the hangup ends it at once rather than only the grace's kill.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    // SAFETY: sets this test process's own SIGHUP disposition, restored below; nothing here raises it.
+    let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let took = runtime.block_on(hang_up("exec sleep 1000"));
+    // SAFETY: restores the disposition saved above.
+    unsafe { libc::signal(libc::SIGHUP, previous) };
+    assert!(took < HANGUP_GRACE, "the hangup itself ended it: {took:?}");
+}

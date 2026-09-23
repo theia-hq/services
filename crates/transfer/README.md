@@ -15,9 +15,15 @@ One stream carries one file. Call it once per stream; this crate has no fan-out 
 ## The entry point
 
 `Recv::new(out)` is the whole engine: a `Handler` impl whose ceiling is `Never` (a stranger writing files
-into the node's sink has no public use), bound to the `recv:` route. The protocol body is crate-private.
-Each instance owns its sink directory and its per-stream temp tag, so two receive services never share a
-sink and concurrent pushes never contend for the same temp path. The caller owns admission and disk bounds.
+into the node's output directory has no public use), bound to the `recv:` route. The protocol body is
+crate-private. Each instance owns its output directory and its per-stream temp tag, so two receive services
+never share one and concurrent pushes never contend for the same temp path. The caller owns admission and
+disk bounds.
+
+The engine prints nothing. To hear about files that land, build it with `Recv::new(out).with_sink(sink)`:
+each landed file is handed to `sink` as a `Received` value (its path and byte count), once, after it is in
+place. The path is the sender's name, so escape it before you print it. A `ReceivedSink` must not block,
+because it runs before the stream finishes.
 
 ## The limits
 
