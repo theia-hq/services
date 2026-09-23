@@ -20,6 +20,7 @@
 //! the shell runs as this process's uid).
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::time::Duration;
 
 use pty_process::{Command, Size};
 use russh::server::{Handler, Msg, Session};
@@ -36,6 +37,11 @@ pub use handler::Sshd;
 /// request is refused (`channel_failure`); the ceiling is generous for real interactive/exec use and
 /// bounded against abuse. Node-wide, not per-connection, because a flood opens many connections.
 const MAX_LIVE_SHELLS: usize = 64;
+
+/// How long a hung-up shell has to exit before its process group is killed. A shell exits on the hangup
+/// at once; one that ignores it (a `trap '' HUP`, a `nohup`ed job left as the leader) would otherwise hold
+/// its live-shell slot, and run as this user, for as long as the process lives.
+const HANGUP_GRACE: Duration = Duration::from_secs(3);
 
 /// Live shell count across the whole process, reserved by [`ShellSlot`].
 static LIVE_SHELLS: AtomicUsize = AtomicUsize::new(0);
@@ -129,24 +135,62 @@ where
         methods: russh::MethodSet::from(&[russh::MethodKind::None][..]),
         ..Default::default()
     });
+    // The connection's lifetime, as every shell it spawns sees it: this sender lives in this frame and
+    // nowhere else, so it drops exactly when `serve` ends, whether the session finished or the caller
+    // dropped this future to cut it. Each shell's task watches for that drop and hangs up its pty.
+    let (hangup_tx, hangup) = watch::channel(());
     // Join the two stream halves into one duplex for russh, then run the SSH session to completion.
     let stream = tokio::io::join(reader, writer);
-    let running = russh::server::run_stream(config, stream, Shell::default())
+    let running = russh::server::run_stream(config, stream, Shell::new(hangup))
         .await
         .map_err(ServeError::Handshake)?;
     // russh spawns the SSH session on a DETACHED task the moment `run_stream` returns Ok; `running.await`
-    // only OBSERVES its completion, it does not drive it. So cancelling `serve` (dropping this future) does
-    // not abort an in-flight shell, it only stops us awaiting it: the shell runs until the client
-    // disconnects or exits. Not a leak (the shell is bounded by the caller's live-session cap), but the
-    // reason a session cannot be torn down mid-flight by dropping `serve`.
+    // only OBSERVES its completion, it does not drive it, and the shells run on tasks of their own. So
+    // dropping this future stops no task by itself. This guard is what does: dropping `serve` drops it,
+    // which hangs up every shell this connection spawned and ends the detached session, so the stream
+    // halves it owns are released too.
+    let _connection = Connection {
+        _hangup: hangup_tx,
+        session: running.handle(),
+    };
     running.await.map_err(ServeError::Session)?;
     Ok(())
+}
+
+/// One connection's lifetime, held by [`serve`]'s frame and nowhere else, so it ends exactly when `serve`
+/// does: because the session finished, or because the caller dropped `serve` to cut it.
+struct Connection {
+    /// Dropping it hangs up every shell the connection spawned (see [`hung_up`]).
+    _hangup: watch::Sender<()>,
+    /// The detached SSH session. It owns the stream halves, so it is told to disconnect: a stream it held
+    /// on to could keep the caller's transport connection open after the caller let go of it.
+    session: russh::server::Handle,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Drop cannot await, and the disconnect is a message to the session task, so hand it to the
+        // runtime. A session that already ended simply refuses the message. Outside a runtime there is no
+        // session task left to tell.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let session = self.session.clone();
+        runtime.spawn(async move {
+            let _ = session
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "session ended".to_owned(),
+                    String::new(),
+                )
+                .await;
+        });
+    }
 }
 
 /// Per-connection handler: hold the opened session channel and the requested pty geometry, then on a
 /// shell/exec request spawn the shell in a pty and splice the channel to it. Auth is not implemented, so
 /// russh's default `auth_none` (accept) stands: the overlay already proved the peer.
-#[derive(Default)]
 struct Shell {
     channel: Option<Channel<Msg>>,
     term: String,
@@ -157,9 +201,24 @@ struct Shell {
     /// applies it; the pty is never shared. `None` before the shell spawns, so a window-change that
     /// arrives first is captured into `cols`/`rows` and used as the initial size instead.
     resize: Option<watch::Sender<Size>>,
+    /// Resolves, through [`hung_up`], once the connection this handler serves is over. Cloned into every
+    /// shell's task, so no shell outlives the connection it was opened on.
+    hangup: watch::Receiver<()>,
 }
 
 impl Shell {
+    /// A handler for one connection, whose shells hang up when `hangup`'s sender drops.
+    fn new(hangup: watch::Receiver<()>) -> Self {
+        Self {
+            channel: None,
+            term: String::new(),
+            cols: 0,
+            rows: 0,
+            resize: None,
+            hangup,
+        }
+    }
+
     /// Spawn the shell (a login shell, or `sh -c <command>` for exec) in a pty at the requested size and
     /// splice the ssh channel to it, on its own task so the handler stays responsive.
     fn spawn(
@@ -202,11 +261,13 @@ impl Shell {
         } else {
             &self.term
         };
-        let cmd = match &command {
-            Some(command) => Command::new("/bin/sh").arg("-c").arg(command),
-            None => Command::new(login_shell()),
-        }
-        .env("TERM", term);
+        let cmd = default_signals(
+            match &command {
+                Some(command) => Command::new("/bin/sh").arg("-c").arg(command),
+                None => Command::new(login_shell()),
+            }
+            .env("TERM", term),
+        );
         let child = match cmd.spawn(pts) {
             Ok(child) => child,
             Err(_) => {
@@ -215,6 +276,7 @@ impl Shell {
             }
         };
         let handle = session.handle();
+        let hangup = self.hangup.clone();
         session.channel_success(id)?;
         tokio::spawn(async move {
             // Hold the shell slot for the child's whole lifetime; it releases when this task ends.
@@ -223,9 +285,13 @@ impl Shell {
             // `'static` writer before the borrowing reader.
             let writer = channel.make_writer();
             let reader = channel.make_reader();
-            let _ = splice(pty, writer, reader, resize_rx).await;
+            // A connection that is gone has no channel to report an exit on.
+            let Attended::Exited(code) =
+                attend(pty, child, writer, reader, resize_rx, hangup).await
+            else {
+                return;
+            };
             // Report the shell's exit and close the channel so the client's `ssh` exits cleanly.
-            let code = wait_code(child).await;
             let _ = handle.exit_status_request(id, code).await;
             let _ = handle.eof(id).await;
             let _ = handle.close(id).await;
@@ -316,6 +382,90 @@ impl Handler for Shell {
         let command = String::from_utf8_lossy(data).into_owned();
         self.spawn(id, Some(command), session)
     }
+}
+
+/// How a shell's attendance ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Attended {
+    /// The shell's side closed and it exited with this code, which the client is owed.
+    Exited(u32),
+    /// The connection ended first, so the pty was closed under the shell, and the shell has since exited.
+    HungUp,
+}
+
+/// Serve one shell until it exits or its connection ends, whichever comes first.
+///
+/// When the connection ends first, the splice is dropped mid-flight, and with it the pty master: closing
+/// the master is a terminal hangup, which is what ends a shell whose client is gone, as it does when an
+/// ssh server closes a session's pty. Nothing else here could end it: the connection's future is not
+/// this task, so dropping it would leave the shell running with a pty no one reads, and a live-shell slot
+/// held, until the whole process exited.
+///
+/// Either way the child is waited for before this returns, so the slot the caller holds is released only
+/// once the shell is really gone. One that ignores the hangup is killed with its group after
+/// [`HANGUP_GRACE`] (see [`reap`]), so a cut frees the slot either way.
+async fn attend<W, R>(
+    pty: pty_process::Pty,
+    child: tokio::process::Child,
+    writer: W,
+    reader: R,
+    resize: watch::Receiver<Size>,
+    mut hangup: watch::Receiver<()>,
+) -> Attended
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    // Each arm's body runs only once both futures are gone, so on a hangup the pty is already closed by
+    // the time the wait starts, and the wait can see the shell it hung up exit.
+    tokio::select! {
+        _ = splice(pty, writer, reader, resize) => Attended::Exited(wait_code(child).await),
+        () = hung_up(&mut hangup) => {
+            reap(child).await;
+            Attended::HungUp
+        }
+    }
+}
+
+/// Wait out [`HANGUP_GRACE`] for a hung-up shell, then kill its process group and wait for it. The shell
+/// leads its own session and group (the pty spawn makes it so), so the group is the shell and everything
+/// it started in the foreground; a job it detached into a group of its own is the holder's, and outlives it.
+async fn reap(mut child: tokio::process::Child) {
+    if tokio::time::timeout(HANGUP_GRACE, child.wait())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: `killpg` only sends a signal; `group` is the pgid of our own unreaped child, so it
+        // cannot have been recycled for another process.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// A shell command whose child starts with the hangup, interrupt and quit signals at their defaults,
+/// whatever this process inherited. A serve started under `nohup`, or in the background of a
+/// non-interactive shell, ignores them, and an ignored disposition survives `exec`: its shells would then
+/// shrug off the very hangup that ends them when their connection goes.
+fn default_signals(command: Command) -> Command {
+    // SAFETY: the closure runs in the forked child before `exec`, where only async-signal-safe calls are
+    // allowed; `signal` is one, and it changes the child's dispositions only, never this process's.
+    unsafe {
+        command.pre_exec(|| {
+            for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Resolve once the connection's sender is dropped. It never sends, so a change is only ever the drop.
+async fn hung_up(hangup: &mut watch::Receiver<()>) {
+    while hangup.changed().await.is_ok() {}
 }
 
 /// Copy bytes both ways between the pty and the ssh channel until both sides close, applying any
