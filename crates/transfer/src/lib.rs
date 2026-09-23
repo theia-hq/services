@@ -15,9 +15,14 @@
 //! directory's files land in parallel with no fan-out logic here: each invocation is one file, start to
 //! finish.
 
+// An engine produces facts and never prints: a landed file leaves as a value through the sink its
+// caller installed, and the caller owns every line a user sees. A print macro here would put
+// peer-named bytes on a terminal past the one place that escapes them, so it fails the build.
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+
 mod handler;
 mod serve;
 
-pub use handler::Recv;
+pub use handler::{ReceivedSink, Recv};
 
 pub use crate::serve::{ReceiveError, Received, safe_relative_path};

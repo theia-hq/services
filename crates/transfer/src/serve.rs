@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use bifrost::wire::Transfer;
 use tokio::io::{self, AsyncWriteExt as _};
 
-use crate::handler::render_path;
-
 /// Receive one pushed file over an admitted stream: stream it into a temp file under `out`, verify it end
 /// to end (`bifrost-wire` checks every byte against the sender's BLAKE3 root), then move it into place at
 /// the safe relative path the sender named. On any failure the temp file is removed, so a rejected or
@@ -31,23 +29,23 @@ where
 {
     let temp = out.join(format!(".transfer-{}-{tag}.part", std::process::id()));
     let received = {
-        let mut sink =
+        let mut file =
             tokio::fs::File::create(&temp)
                 .await
                 .map_err(|source| ReceiveError::CreateTemp {
                     path: render_path(&temp),
                     source,
                 })?;
-        match Transfer::new(writer, reader).recv(&mut sink).await {
+        match Transfer::new(writer, reader).recv(&mut file).await {
             Ok(received) => {
-                sink.flush().await.map_err(|source| ReceiveError::Flush {
+                file.flush().await.map_err(|source| ReceiveError::Flush {
                     path: render_path(&temp),
                     source,
                 })?;
                 received
             }
             Err(err) => {
-                drop(sink);
+                drop(file);
                 let _ = tokio::fs::remove_file(&temp).await;
                 return Err(ReceiveError::Transfer(err));
             }
@@ -64,9 +62,8 @@ where
                 source,
             })?;
     }
-    // Every path in an error renders through the same escape/cap helper as the success event: the serve
-    // loop logs the text at warn, and the sender names the final path, so a raw newline or ESC may not
-    // ride the line.
+    // Every path in an error renders through `render_path`: the dispatcher logs the error text at warn,
+    // and the sender names the final path, so a raw newline or ESC may not ride the line.
     tokio::fs::rename(&temp, &final_path)
         .await
         .map_err(|source| ReceiveError::Save {
@@ -127,7 +124,9 @@ pub enum ReceiveError {
 }
 
 /// One received file: the safe relative path it was saved at under the output directory, and its verified
-/// byte length. Returned so the caller can report what landed.
+/// byte length. The fact a [`ReceivedSink`](crate::ReceivedSink) is handed, so the caller can report what
+/// landed. The path is raw and peer-named: safe to join under the output directory, never safe to print
+/// unescaped.
 #[derive(Debug, Clone)]
 pub struct Received {
     /// The path the file was saved at, relative to the output directory.
@@ -154,6 +153,52 @@ pub fn safe_relative_path(header: &[u8]) -> PathBuf {
         safe.push("download");
     }
     safe
+}
+
+/// Letters that render as blank space on a terminal. `char::escape_debug` treats them as printable and
+/// passes them raw, so a path made only of them would print as nothing. They are escaped so a path in an
+/// error is never invisible. A product rendering the engine's facts should escape the same set.
+const BLANK_LETTERS: [char; 5] = ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}', '\u{2800}'];
+
+/// The longest a path may render in an error's text, in characters. The final path is peer-named and
+/// unbounded up to the wire frame, so the render caps what reaches the log.
+const MAX_RENDERED_PATH: usize = 256;
+
+/// Render a path for an error's text: escape control characters and cap the rendered length. A raw
+/// newline forges a log line, a carriage return rewrites one, and ESC drives a terminal, so none may reach
+/// a line as-is. Escapes are rendered whole: when the next complete escape would pass the cap, the render
+/// appends the cut marker and stops, so the cut never lands inside a sequence. `char::escape_debug` leaves
+/// printable text alone except grapheme-extended marks, which it escapes (a combining accent renders as
+/// `\u{...}`; an emoji passes raw). [`BLANK_LETTERS`] render as `\u{...}` too.
+///
+/// Errors need this here, in the engine, because their text is logged by the dispatcher that calls
+/// `serve`, a channel no caller renders. A landed file is not rendered here at all: it leaves as a raw
+/// [`Received`] value, and the caller that installed the sink escapes it where it prints it.
+fn render_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    // The cap plus the `...` cut marker: allocation is bounded whatever the peer names.
+    let mut rendered = String::with_capacity(MAX_RENDERED_PATH + 3);
+    let mut written = 0usize;
+    for ch in raw.chars() {
+        let blank = BLANK_LETTERS.contains(&ch);
+        // The width is the whole escape's, so the cap check below never admits half of one.
+        let width = if blank {
+            ch.escape_unicode().len()
+        } else {
+            ch.escape_debug().len()
+        };
+        if written + width > MAX_RENDERED_PATH {
+            rendered.push_str("...");
+            break;
+        }
+        if blank {
+            rendered.extend(ch.escape_unicode());
+        } else {
+            rendered.extend(ch.escape_debug());
+        }
+        written += width;
+    }
+    rendered
 }
 
 #[cfg(test)]
