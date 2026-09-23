@@ -3,7 +3,7 @@
 All notable changes to `transfer`, newest first. It carries its own version and its own cadence, so a
 release here moves `transfer` and nothing else in this repository.
 
-## Unreleased
+## v0.4.0
 
 ### Changed
 - **`Recv` no longer logs a received file; it hands it to you.** Build it with
