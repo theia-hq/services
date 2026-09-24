@@ -1,7 +1,8 @@
 # Fails CI on a layering leak so a future leak is caught by the machine, not by review.
-# A crate must not NAME a consumer-tier theia crate it does not depend on, and a prime
-# library must not allude to a consumer CLI flag (`--for`/`--public`/`--peer`/`--authkey`/`--to`).
-# Pure sh + grep, no toolchain. The check lives in scripts/layering-gate.sh.
+# A crate must not NAME a consumer-tier theia crate it does not depend on, a prime library
+# must not allude to a consumer CLI flag (`--for`/`--public`/`--peer`/`--authkey`/`--to`), and
+# no file but a CHANGELOG may name a consumer at all. Pure sh + grep, no toolchain.
+# The check lives in scripts/layering-gate.sh.
 name: layering-gate
 on:
   push:
