@@ -3,6 +3,15 @@
 All notable changes to `sshh`, newest first. It carries its own version and its own cadence, so a
 release here moves `sshh` and nothing else in this repository.
 
+## v0.6.0
+
+### Changed
+- **The host key is derived under `sshh host key v1`.** Every node's host key changes.
+- **Needs Rust 1.91 or newer.** The minimum was 1.85. tightbeam v0.16.0 and bifrost v0.7.0 need
+  1.91.
+- Builds against tightbeam v0.16.0's handler contract, nauthy v0.9.0 and bifrost v0.7.0. The
+  contract itself is unchanged.
+
 ## v0.5.0
 
 ### Changed

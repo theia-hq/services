@@ -3,10 +3,12 @@
 All notable changes to `measure`, newest first. It carries its own version and its own cadence, so a
 release here moves `measure` and nothing else in this repository.
 
-## Unreleased
+## v0.5.0
 
 ### Changed
-- Builds against tightbeam v0.15.0's handler contract, nauthy v0.7.0 and bifrost v0.6.1. The
+- **Needs Rust 1.91 or newer.** The minimum was 1.85. tightbeam v0.16.0 and bifrost v0.7.0 need
+  1.91.
+- Builds against tightbeam v0.16.0's handler contract, nauthy v0.9.0 and bifrost v0.7.0. The
   contract itself is unchanged.
 
 ## v0.4.0
