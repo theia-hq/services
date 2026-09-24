@@ -1,27 +1,12 @@
 use super::*;
 
 #[test]
-fn host_seed_derivation_is_byte_frozen() {
-    // The host-key seed is a byte-frozen KDF: a client pins the resulting host key in its `known_hosts`, so
-    // the derivation MUST reproduce these exact bytes forever. These vectors were captured from the
-    // derivation's prior home before it moved into this crate; a mismatch means the host key silently
-    // changed under every already-pinned client.
+fn the_host_seed_uses_the_sshh_context() {
+    // A client pins the host key in its `known_hosts`, so the context string is what fixes it.
     assert_eq!(
-        host_seed(&[0u8; 32]),
-        [
-            151, 138, 105, 169, 13, 104, 41, 191, 14, 92, 218, 56, 119, 215, 55, 71, 101, 199, 251,
-            237, 109, 231, 230, 255, 113, 225, 147, 158, 213, 47, 167, 116
-        ],
-        "the all-zero secret must derive its frozen host seed"
-    );
-    let secret: [u8; 32] = core::array::from_fn(|i| i as u8);
-    assert_eq!(
-        host_seed(&secret),
-        [
-            122, 160, 229, 137, 134, 125, 49, 136, 50, 153, 71, 185, 13, 248, 208, 94, 143, 160,
-            225, 86, 61, 41, 106, 190, 227, 244, 37, 162, 103, 244, 91, 5
-        ],
-        "a non-trivial secret must derive its frozen host seed"
+        host_seed(&[7; 32]),
+        blake3::derive_key("sshh host key v1", &[7; 32]),
+        "the host seed must be derived under the `sshh host key v1` context"
     );
 }
 

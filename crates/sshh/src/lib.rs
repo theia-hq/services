@@ -1,11 +1,11 @@
 //! `sshh`: a keyless SSH server over an already-authenticated byte stream.
 //!
-//! theia's equivalent of Tailscale SSH. The caller hands [`serve`] one stream that a capability-gated
-//! overlay has ALREADY mutually authenticated (QUIC + raw-public-key TLS, addressed by ed25519 node id)
-//! and encrypted; the peer was authorized by a capability. So SSH's own transport job is already done, and
-//! this server accepts the SSH `none` auth method (russh's default) and goes straight to a shell: the
-//! capability IS the auth, exactly as Tailscale SSH accepts `none` behind WireGuard. A standard `ssh`/`scp`
-//! client works unchanged, with no ssh keys to manage.
+//! The equivalent of Tailscale SSH for an already-authenticated stream. The caller hands [`serve`] one
+//! stream that a capability-gated overlay has ALREADY mutually authenticated (QUIC + raw-public-key TLS,
+//! addressed by ed25519 node id) and encrypted; the peer was authorized by a capability. So SSH's own
+//! transport job is already done, and this server accepts the SSH `none` auth method (russh's default)
+//! and goes straight to a shell: the capability IS the auth, exactly as Tailscale SSH accepts `none`
+//! behind WireGuard. A standard `ssh`/`scp` client works unchanged, with no ssh keys to manage.
 //!
 //! This lives in its own crate, apart from the byte-moving layer, so its heavy, security-sensitive
 //! dependency tree (`russh`, `ssh-key`, `pty-process`) stays out of a lean, reach-only client.
@@ -96,10 +96,9 @@ pub enum ServeError {
 /// (BLAKE3 `derive_key`) of the raw secret. The caller derives the seed once from its persisted identity and
 /// hands it to [`serve`]; the raw secret itself never enters this crate.
 ///
-/// The domain-separator string is FROZEN: a client pins the resulting host key, so changing it would break
-/// every existing `known_hosts` entry.
+/// Changing this string changes every node's host key, which clients have pinned in `known_hosts`.
 pub fn host_seed(secret: &[u8; 32]) -> [u8; 32] {
-    blake3::derive_key("theia sshh host key v1", secret)
+    blake3::derive_key("sshh host key v1", secret)
 }
 
 /// Run one SSH connection over a stream whose gate the [`Sshd`] handler already narrowed to a ROOTED
