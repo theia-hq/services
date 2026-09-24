@@ -441,31 +441,42 @@ async fn a_signalled_exec_reports_exit_signal() {
     }
 }
 
-#[tokio::test]
-async fn a_cut_session_hangs_up_a_pipe_exec_blocked_off_stdin() {
+/// Open a session and exec `command` on pipes, which prints a pid as its first line. Returns the pid, the
+/// session's task to abort for the cut, and the client, held so only the abort ends the session.
+async fn exec_printing_a_pid(
+    command: &str,
+) -> (
+    u32,
+    tokio::task::JoinHandle<Result<(), ServeError>>,
+    russh::client::Handle<Client>,
+) {
     let (client, server) = connect().await;
     let mut channel = client
         .channel_open_session()
         .await
         .expect("a session channel opens");
-    channel
-        .exec(true, "echo $$; exec sleep 60")
-        .await
-        .expect("the exec is sent");
+    channel.exec(true, command).await.expect("the exec is sent");
     let mut line = Vec::new();
     while !line.ends_with(b"\n") {
         match channel.wait().await {
             Some(russh::ChannelMsg::Data { data }) => line.extend_from_slice(&data),
             Some(_) => {}
-            None => panic!("the channel closed before the child's pid arrived"),
+            None => panic!("the channel closed before the pid arrived"),
         }
     }
     let pid: u32 = String::from_utf8_lossy(&line)
         .trim()
         .parse()
-        .expect("the child printed its pid");
-    assert!(alive(pid), "the child runs while its session lives");
+        .expect("the exec printed a pid");
+    (pid, server, client)
+}
 
+/// Cut the session and return how long `pid` took to be gone, asserting it went within twice the grace.
+async fn cut(
+    pid: u32,
+    server: tokio::task::JoinHandle<Result<(), ServeError>>,
+) -> core::time::Duration {
+    assert!(alive(pid), "the process runs while its session lives");
     // Dropping the session is the cut.
     server.abort();
     let started = std::time::Instant::now();
@@ -473,11 +484,101 @@ async fn a_cut_session_hangs_up_a_pipe_exec_blocked_off_stdin() {
         tokio::time::sleep(core::time::Duration::from_millis(20)).await;
     }
     let took = started.elapsed();
-    assert!(!alive(pid), "the child does not outlive the cut");
+    assert!(!alive(pid), "the process outlived the cut and the grace");
+    took
+}
+
+#[tokio::test]
+async fn a_cut_session_hangs_up_a_pipe_exec_blocked_off_stdin() {
+    let (pid, server, _client) = exec_printing_a_pid("echo $$; exec sleep 60").await;
+    let took = cut(pid, server).await;
     assert!(
         took < HANGUP_GRACE,
         "the hangup ended it, not the grace's kill: {took:?}"
     );
+}
+
+#[tokio::test]
+async fn a_cut_session_hangs_up_a_grandchild_holding_stdout() {
+    // The shell exits at once; the sleep it left behind holds stdout, which keeps the exec open. The cut
+    // must still reach the sleep, though the process that led its group is gone.
+    let (pid, server, _client) = exec_printing_a_pid("sleep 60 & echo $!").await;
+    tokio::time::sleep(core::time::Duration::from_millis(500)).await;
+    let took = cut(pid, server).await;
+    assert!(
+        took < HANGUP_GRACE,
+        "the hangup ended it, not the grace's kill: {took:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cut_session_kills_a_grandchild_that_ignores_the_hangup() {
+    // As above, but the sleep ignores SIGHUP: only the group's kill after the grace ends it, and that
+    // kill must come though the shell that led the group exited long before.
+    let (pid, server, _client) = exec_printing_a_pid("trap '' HUP; sleep 60 & echo $!").await;
+    tokio::time::sleep(core::time::Duration::from_millis(500)).await;
+    let took = cut(pid, server).await;
+    assert!(
+        took >= HANGUP_GRACE,
+        "killed after the grace, not before: {took:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_exec_on_a_second_channel_without_a_pty_request_runs_on_pipes() {
+    // Two channels on one connection, as ssh multiplexing makes them: the first asks for a pty, the
+    // second does not, and must get pipes.
+    let (client, _server) = connect().await;
+    let mut first = client
+        .channel_open_session()
+        .await
+        .expect("the first channel opens");
+    first
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .expect("the pty request is sent");
+    first
+        .exec(true, "exit 0")
+        .await
+        .expect("the first exec is sent");
+    first.eof().await.expect("end of input is sent");
+    let first_done = tokio::time::timeout(EXEC_LIMIT, async {
+        while let Some(message) = first.wait().await {
+            if let russh::ChannelMsg::Close = message {
+                break;
+            }
+        }
+    });
+    first_done.await.expect("the first exec ends");
+
+    let mut second = client
+        .channel_open_session()
+        .await
+        .expect("the second channel opens");
+    second
+        .exec(true, "if test -t 0; then echo TTY; else echo PIPE; fi")
+        .await
+        .expect("the second exec is sent");
+    second.eof().await.expect("end of input is sent");
+    let mut stdout = Vec::new();
+    let mut status = None;
+    tokio::time::timeout(EXEC_LIMIT, async {
+        while let Some(message) = second.wait().await {
+            match message {
+                russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the second exec must end on its own");
+    assert_eq!(
+        stdout, b"PIPE\n",
+        "the pty asked for on another channel is not this one's"
+    );
+    assert_eq!(status, Some(0));
 }
 
 /// Set for the probe below when this test binary runs it under a terminal of its own.

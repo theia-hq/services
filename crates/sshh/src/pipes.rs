@@ -47,8 +47,11 @@ pub(crate) fn spawn(command: &str) -> io::Result<Piped> {
         let _ = child.start_kill();
         return Err(io::Error::other("a piped child is missing a pipe"));
     };
+    // The child leads its own group, so its pid is the group's id, fixed from here on.
+    let group = child.id().and_then(|pid| i32::try_from(pid).ok());
     Ok(Piped {
         child,
+        group,
         stdin,
         stdout,
         stderr,
@@ -58,6 +61,9 @@ pub(crate) fn spawn(command: &str) -> io::Result<Piped> {
 /// A running child and the three pipes it was started with, held apart so each gets its own pump.
 pub(crate) struct Piped {
     pub(crate) child: Child,
+    /// The child's process group, taken at spawn. The cut signals this, never `child.id()`, which is gone
+    /// once the child is reaped while a process it started may still hold the group and the exec open.
+    group: Option<i32>,
     stdin: ChildStdin,
     stdout: ChildStdout,
     stderr: ChildStderr,
@@ -72,8 +78,8 @@ pub(crate) struct Piped {
 /// and every byte it wrote is sent before the caller reports its exit. A grandchild that keeps stdout or
 /// stderr open keeps the exec open with it.
 ///
-/// On a cut the three pipes are dropped, the child's group gets SIGHUP, and [`reap`] kills what is left
-/// after the grace, so the slot the caller holds is released only once the child is gone.
+/// On a cut the three pipes are dropped, the child's group gets SIGHUP, and [`reap`] kills what is left of
+/// the group after the grace, so the slot the caller holds is released only once the group is gone.
 pub(crate) async fn attend<O, E, I>(
     piped: Piped,
     stdout: O,
@@ -88,6 +94,7 @@ where
 {
     let Piped {
         mut child,
+        group,
         stdin,
         stdout: out,
         stderr: err,
@@ -98,18 +105,24 @@ where
         }
         () = hung_up(&mut hangup) => {
             // The pumps are dropped by now, so the child's pipes are closed on our side.
-            if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-                // SAFETY: `killpg` only sends a signal; `group` is the pgid of our own unreaped child
-                // (it leads its own group), so it cannot have been recycled for another process.
+            if let Some(group) = group {
+                // SAFETY: `killpg` only sends a signal. `group` is the pgid of our own child, which leads
+                // it and is still unreaped here, running or a zombie ([`finish`] reaps it only after both
+                // output pipes drain), so its id cannot have been recycled for another process.
                 unsafe { libc::killpg(group, libc::SIGHUP) };
             }
-            reap(child).await;
+            reap(child, group).await;
             Attended::HungUp
         }
     }
 }
 
-/// Wait for the child to exit and both output pumps to drain, while the input pump runs beside them.
+/// Wait for both output pumps to drain and then for the child to exit, while the input pump runs beside
+/// them.
+///
+/// The child is reaped only after the drains, never alongside them: a process it started can hold its
+/// output open after it exits, and until it is reaped its zombie keeps its pid, and so the group's id,
+/// reserved for the hangup a cut in that state sends.
 ///
 /// The input pump is dropped, unfinished if need be, once the rest is done: the exec ends with the child,
 /// not with the client's input.
@@ -120,8 +133,8 @@ where
     E: Future<Output = ()>,
 {
     let done = async {
-        let (status, (), ()) = tokio::join!(child.wait(), stdout, stderr);
-        status.map_or(Exit::Unknown, Exit::from)
+        let ((), ()) = tokio::join!(stdout, stderr);
+        child.wait().await.map_or(Exit::Unknown, Exit::from)
     };
     let input = async {
         input.await;

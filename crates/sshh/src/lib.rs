@@ -207,9 +207,11 @@ impl Drop for Connection {
 /// default `auth_none` (accept) stands: the overlay already proved the peer.
 struct Shell {
     channel: Option<Channel<Msg>>,
-    /// The client's `pty_request`, if it made one. A command runs in a terminal only when it did, as with
-    /// OpenSSH: a pty's line discipline rewrites and echoes bytes, caps a line, never passes end of input
-    /// on, and merges stderr into stdout, so a command run in one cannot read binary input to its end.
+    /// The client's `pty_request`, if it made one, and the channel it came on. A command runs in a terminal
+    /// only when its own channel asked for one, as with OpenSSH: a pty's line discipline rewrites and
+    /// echoes bytes, caps a line, never passes end of input on, and merges stderr into stdout, so a command
+    /// run in one cannot read binary input to its end. A connection carries many channels (ssh
+    /// multiplexing), so a pty asked for on one says nothing about the next.
     terminal: Terminal,
     term: String,
     cols: u16,
@@ -246,8 +248,11 @@ impl Shell {
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         match (command, &self.terminal) {
-            (Some(command), Terminal::None) => self.spawn_piped(id, &command, session),
-            (command, _) => self.spawn(id, command, session),
+            (Some(command), Terminal::Requested(on)) if *on == id => {
+                self.spawn(id, Some(command), session)
+            }
+            (Some(command), _) => self.spawn_piped(id, &command, session),
+            (None, _) => self.spawn(id, None, session),
         }
     }
 
@@ -399,7 +404,7 @@ impl Handler for Shell {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.terminal = Terminal::Requested;
+        self.terminal = Terminal::Requested(id);
         self.term = term.to_owned();
         self.cols = col_width as u16;
         self.rows = row_height as u16;
@@ -452,12 +457,13 @@ impl Handler for Shell {
     }
 }
 
-/// Whether the client asked for a terminal on this channel.
+/// Whether the client asked for a terminal, and on which channel.
 enum Terminal {
     /// No `pty_request`: a command runs on pipes.
     None,
-    /// A `pty_request` arrived: a command runs in a pty, as a shell always does.
-    Requested,
+    /// A `pty_request` arrived on this channel: a command on it runs in a pty, as a shell always does. A
+    /// command on any other channel runs on pipes.
+    Requested(ChannelId),
 }
 
 /// The SSH extended-data type that carries stderr (RFC 4254 section 5.2).
@@ -546,6 +552,15 @@ fn sig(signal: i32) -> russh::Sig {
         libc::SIGWINCH => custom("WINCH"),
         libc::SIGXCPU => custom("XCPU"),
         libc::SIGXFSZ => custom("XFSZ"),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::SIGPWR => custom("PWR"),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::SIGSTKFLT => custom("STKFLT"),
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        libc::SIGEMT => custom("EMT"),
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        libc::SIGINFO => custom("INFO"),
+        // Only a real-time signal is left, which has no name of its own.
         other => Sig::Custom(other.to_string()),
     }
 }
@@ -582,35 +597,69 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    // The shell leads its own session and group, so its pid is the group's id.
+    let group = child.id().and_then(|pid| i32::try_from(pid).ok());
     // Each arm's body runs only once both futures are gone, so on a hangup the pty is already closed by
     // the time the wait starts, and the wait can see the shell it hung up exit.
     tokio::select! {
         _ = splice(pty, writer, reader, resize) => Attended::Exited(wait_exit(child).await),
         () = hung_up(&mut hangup) => {
-            reap(child).await;
+            reap(child, group).await;
             Attended::HungUp
         }
     }
 }
 
-/// Wait out [`HANGUP_GRACE`] for a hung-up shell, then kill its process group and wait for it. The shell
-/// leads its own session and group (the pty spawn and the pipe spawn both make it so), so the group is the
-/// shell and everything it started in the foreground; a job it detached into a group of its own is the
-/// holder's, and outlives it.
-async fn reap(mut child: tokio::process::Child) {
-    if tokio::time::timeout(HANGUP_GRACE, child.wait())
+/// Give a hung-up shell's process `group` [`HANGUP_GRACE`] to be gone, then kill what is left of it, and
+/// reap the shell. The shell leads its own session and group (the pty spawn and the pipe spawn both make
+/// it so), so the group is the shell and everything it started in the foreground; a job it detached into
+/// a group of its own is the holder's, and outlives it.
+///
+/// The group can outlive its leader: a process the shell started may still run, and hold a pipe exec
+/// open, after the shell itself has exited. So the kill goes to the group whether or not the shell is
+/// gone, and this returns early only once the whole group is.
+async fn reap(mut child: tokio::process::Child, group: Option<i32>) {
+    let deadline = tokio::time::Instant::now() + HANGUP_GRACE;
+    if tokio::time::timeout_at(deadline, child.wait())
         .await
-        .is_ok()
+        .is_err()
     {
+        if let Some(group) = group {
+            // SAFETY: `killpg` only sends a signal; `group` is the pgid of our own child, which leads it
+            // and is still unreaped, so its id cannot have been recycled for another process.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
         return;
     }
-    if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-        // SAFETY: `killpg` only sends a signal; `group` is the pgid of our own unreaped child, so it
-        // cannot have been recycled for another process.
-        unsafe { libc::killpg(group, libc::SIGKILL) };
+    // The shell is gone and reaped. The group's id stays reserved while any member lives, so it is probed
+    // until it empties, and killed if it has not by the deadline.
+    let Some(group) = group else {
+        return;
+    };
+    while group_lives(group) {
+        if tokio::time::Instant::now() >= deadline {
+            // SAFETY: `killpg` only sends a signal. The group had a member at the probe just before, and
+            // an id is never reissued while a group of that id has a member; only the group emptying
+            // between that probe and this call, with its id reissued to a new group in that instant,
+            // would let this reach another group.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+            return;
+        }
+        tokio::time::sleep(GROUP_PROBE).await;
     }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+}
+
+/// How often [`reap`] checks whether a group whose leader is gone has emptied.
+const GROUP_PROBE: Duration = Duration::from_millis(20);
+
+/// Whether process group `group` has a member left.
+fn group_lives(group: i32) -> bool {
+    // SAFETY: `killpg` with signal 0 sends nothing; it only reports whether the group exists. A group it
+    // may not signal still exists.
+    let probed = unsafe { libc::killpg(group, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// A pty command whose child starts with its signals reset (see [`reset_signals`]).
