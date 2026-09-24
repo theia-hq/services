@@ -29,6 +29,7 @@ use tokio::io::{self, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as
 use tokio::sync::watch;
 
 mod handler;
+mod pipes;
 pub use handler::Sshd;
 
 /// The maximum number of concurrent shells this process serves across ALL connections. A shell has no
@@ -43,30 +44,33 @@ const MAX_LIVE_SHELLS: usize = 64;
 /// its live-shell slot, and run as this user, for as long as the process lives.
 const HANGUP_GRACE: Duration = Duration::from_secs(3);
 
-/// Live shell count across the whole process, reserved by [`ShellSlot`].
-static LIVE_SHELLS: AtomicUsize = AtomicUsize::new(0);
+/// Live shell count across the whole process.
+static LIVE_SHELLS: ShellSlots = ShellSlots(AtomicUsize::new(0));
 
-/// An RAII reservation of one concurrent-shell slot. Held for the shell's whole lifetime (moved into the
-/// serving task) and released on drop (including every early return before the task is spawned), so the
-/// count can never leak a slot and wedge the cap shut.
-struct ShellSlot;
+/// A count of live shells, capped at [`MAX_LIVE_SHELLS`] and reserved one [`ShellSlot`] at a time.
+struct ShellSlots(AtomicUsize);
 
-impl ShellSlot {
-    /// Reserve a slot, or `None` if the process is already at [`MAX_LIVE_SHELLS`]. The reserve-then-check
+impl ShellSlots {
+    /// Reserve a slot, or `None` if the count is already at [`MAX_LIVE_SHELLS`]. The reserve-then-check
     /// (fetch_add, roll back if over) is race-free under concurrent connections.
-    fn acquire() -> Option<Self> {
-        if LIVE_SHELLS.fetch_add(1, Ordering::AcqRel) >= MAX_LIVE_SHELLS {
-            LIVE_SHELLS.fetch_sub(1, Ordering::AcqRel);
+    fn acquire(&'static self) -> Option<ShellSlot> {
+        if self.0.fetch_add(1, Ordering::AcqRel) >= MAX_LIVE_SHELLS {
+            self.0.fetch_sub(1, Ordering::AcqRel);
             None
         } else {
-            Some(ShellSlot)
+            Some(ShellSlot(self))
         }
     }
 }
 
+/// An RAII reservation of one concurrent-shell slot. Held for the shell's whole lifetime (moved into the
+/// serving task) and released on drop (including every early return before the task is spawned), so the
+/// count can never leak a slot and wedge the cap shut.
+struct ShellSlot(&'static ShellSlots);
+
 impl Drop for ShellSlot {
     fn drop(&mut self) {
-        LIVE_SHELLS.fetch_sub(1, Ordering::AcqRel);
+        self.0.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -99,8 +103,8 @@ pub fn host_seed(secret: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Run one SSH connection over a stream whose gate the [`Sshd`] handler already narrowed to a ROOTED
-/// admission: accept `none` auth and serve a pty shell. Returns when the client disconnects or the shell
-/// exits.
+/// admission: accept `none` auth and serve a shell or a command. Returns when the client disconnects or
+/// the shell exits.
 ///
 /// CONSUMES a [`RootedAdmitted`](tightbeam_handler::RootedAdmitted) witness: a keyless shell accepting
 /// `none` auth is safe ONLY behind a gate, so requiring the gate's un-forgeable proof makes "authorize
@@ -122,6 +126,15 @@ where
     if is_root() {
         return Err(ServeError::Root);
     }
+    session(host_seed, writer, reader).await
+}
+
+/// The connection itself, once [`serve`] has its witness and has refused root.
+async fn session<W, R>(host_seed: [u8; 32], writer: W, reader: R) -> Result<(), ServeError>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
     // The host key is derived by the caller from the node identity, so it is STABLE across connections:
     // `known_hosts` pins the node you dial instead of a fresh key each time (which trained users to click
     // through host-key warnings). It is not the auth (the overlay already authenticated) but host
@@ -188,11 +201,16 @@ impl Drop for Connection {
     }
 }
 
-/// Per-connection handler: hold the opened session channel and the requested pty geometry, then on a
-/// shell/exec request spawn the shell in a pty and splice the channel to it. Auth is not implemented, so
-/// russh's default `auth_none` (accept) stands: the overlay already proved the peer.
+/// Per-connection handler: hold the opened session channel and the requested pty, if any, then on a
+/// shell or exec request spawn the child and splice the channel to it. A shell, or a command after a pty
+/// request, runs in a pty; a command without one runs on pipes. Auth is not implemented, so russh's
+/// default `auth_none` (accept) stands: the overlay already proved the peer.
 struct Shell {
     channel: Option<Channel<Msg>>,
+    /// The client's `pty_request`, if it made one. A command runs in a terminal only when it did, as with
+    /// OpenSSH: a pty's line discipline rewrites and echoes bytes, caps a line, never passes end of input
+    /// on, and merges stderr into stdout, so a command run in one cannot read binary input to its end.
+    terminal: Terminal,
     term: String,
     cols: u16,
     rows: u16,
@@ -211,12 +229,64 @@ impl Shell {
     fn new(hangup: watch::Receiver<()>) -> Self {
         Self {
             channel: None,
+            terminal: Terminal::None,
             term: String::new(),
             cols: 0,
             rows: 0,
             resize: None,
             hangup,
         }
+    }
+
+    /// Serve a shell or an exec request: in a pty, unless it is a command the client asked no pty for.
+    fn start(
+        &mut self,
+        id: ChannelId,
+        command: Option<String>,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        match (command, &self.terminal) {
+            (Some(command), Terminal::None) => self.spawn_piped(id, &command, session),
+            (command, _) => self.spawn(id, command, session),
+        }
+    }
+
+    /// Spawn `sh -c <command>` on pipes and splice the ssh channel to them, on its own task so the handler
+    /// stays responsive: stdout as channel data, stderr as extended data 1, and channel input into stdin.
+    fn spawn_piped(
+        &mut self,
+        id: ChannelId,
+        command: &str,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let Some(mut channel) = self.channel.take() else {
+            let _ = session.channel_failure(id);
+            return Ok(());
+        };
+        // The same cap as a pty shell, reserved before anything is spawned.
+        let Some(slot) = LIVE_SHELLS.acquire() else {
+            let _ = session.channel_failure(id);
+            return Ok(());
+        };
+        let Ok(piped) = pipes::spawn(command) else {
+            let _ = session.channel_failure(id);
+            return Ok(());
+        };
+        let handle = session.handle();
+        let hangup = self.hangup.clone();
+        session.channel_success(id)?;
+        tokio::spawn(async move {
+            let _slot = slot;
+            let stdout = channel.make_writer();
+            let stderr = channel.make_writer_ext(Some(EXTENDED_DATA_STDERR));
+            let input = channel.make_reader();
+            let Attended::Exited(exit) = pipes::attend(piped, stdout, stderr, input, hangup).await
+            else {
+                return;
+            };
+            report(&handle, id, exit).await;
+        });
+        Ok(())
     }
 
     /// Spawn the shell (a login shell, or `sh -c <command>` for exec) in a pty at the requested size and
@@ -234,7 +304,7 @@ impl Shell {
         // Reserve a concurrent-shell slot BEFORE opening a pty or spawning: at the node's cap, refuse
         // rather than let a flood exhaust the host. The slot releases on any early return below, and is
         // moved into the serving task so it lives exactly as long as the shell.
-        let Some(slot) = ShellSlot::acquire() else {
+        let Some(slot) = LIVE_SHELLS.acquire() else {
             let _ = session.channel_failure(id);
             return Ok(());
         };
@@ -261,7 +331,7 @@ impl Shell {
         } else {
             &self.term
         };
-        let cmd = default_signals(
+        let cmd = pty_signals(
             match &command {
                 Some(command) => Command::new("/bin/sh").arg("-c").arg(command),
                 None => Command::new(login_shell()),
@@ -286,15 +356,12 @@ impl Shell {
             let writer = channel.make_writer();
             let reader = channel.make_reader();
             // A connection that is gone has no channel to report an exit on.
-            let Attended::Exited(code) =
+            let Attended::Exited(exit) =
                 attend(pty, child, writer, reader, resize_rx, hangup).await
             else {
                 return;
             };
-            // Report the shell's exit and close the channel so the client's `ssh` exits cleanly.
-            let _ = handle.exit_status_request(id, code).await;
-            let _ = handle.eof(id).await;
-            let _ = handle.close(id).await;
+            report(&handle, id, exit).await;
         });
         Ok(())
     }
@@ -332,6 +399,7 @@ impl Handler for Shell {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.terminal = Terminal::Requested;
         self.term = term.to_owned();
         self.cols = col_width as u16;
         self.rows = row_height as u16;
@@ -370,7 +438,7 @@ impl Handler for Shell {
         id: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.spawn(id, None, session)
+        self.start(id, None, session)
     }
 
     async fn exec_request(
@@ -380,15 +448,113 @@ impl Handler for Shell {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).into_owned();
-        self.spawn(id, Some(command), session)
+        self.start(id, Some(command), session)
+    }
+}
+
+/// Whether the client asked for a terminal on this channel.
+enum Terminal {
+    /// No `pty_request`: a command runs on pipes.
+    None,
+    /// A `pty_request` arrived: a command runs in a pty, as a shell always does.
+    Requested,
+}
+
+/// The SSH extended-data type that carries stderr (RFC 4254 section 5.2).
+const EXTENDED_DATA_STDERR: u32 = 1;
+
+/// Tell the client how its child ended, then end the channel: the report, `eof`, then `close`, in that
+/// order, and only once every output byte is sent, so nothing the child wrote follows the report.
+async fn report(handle: &russh::server::Handle, id: ChannelId, exit: Exit) {
+    match exit {
+        Exit::Code(code) => {
+            let _ = handle.exit_status_request(id, code).await;
+        }
+        Exit::Signal {
+            signal,
+            core_dumped,
+        } => {
+            // No `exit-status` with it: a client told only of a signal exits non-zero, as OpenSSH's does.
+            let _ = handle
+                .exit_signal_request(id, sig(signal), core_dumped, String::new(), String::new())
+                .await;
+        }
+        Exit::Unknown => {}
+    }
+    let _ = handle.eof(id).await;
+    let _ = handle.close(id).await;
+}
+
+/// How a child ended, as the client is owed it.
+#[derive(Debug, PartialEq, Eq)]
+enum Exit {
+    /// It exited with this code.
+    Code(u32),
+    /// A signal killed it.
+    Signal { signal: i32, core_dumped: bool },
+    /// Its status could not be read. The client gets no report, and its `ssh` exits non-zero.
+    Unknown,
+}
+
+impl From<std::process::ExitStatus> for Exit {
+    fn from(status: std::process::ExitStatus) -> Self {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return Self::Signal {
+                signal,
+                core_dumped: status.core_dumped(),
+            };
+        }
+        status
+            .code()
+            .and_then(|code| u32::try_from(code).ok())
+            .map_or(Self::Unknown, Self::Code)
+    }
+}
+
+/// The SSH name for a signal: a named [`russh::Sig`] where there is one, else its name without `SIG`.
+fn sig(signal: i32) -> russh::Sig {
+    use russh::Sig;
+    let custom = |name: &str| Sig::Custom(name.to_owned());
+    match signal {
+        libc::SIGABRT => Sig::ABRT,
+        libc::SIGALRM => Sig::ALRM,
+        libc::SIGFPE => Sig::FPE,
+        libc::SIGHUP => Sig::HUP,
+        libc::SIGILL => Sig::ILL,
+        libc::SIGINT => Sig::INT,
+        libc::SIGKILL => Sig::KILL,
+        libc::SIGPIPE => Sig::PIPE,
+        libc::SIGQUIT => Sig::QUIT,
+        libc::SIGSEGV => Sig::SEGV,
+        libc::SIGTERM => Sig::TERM,
+        libc::SIGUSR1 => Sig::USR1,
+        libc::SIGBUS => custom("BUS"),
+        libc::SIGCHLD => custom("CHLD"),
+        libc::SIGCONT => custom("CONT"),
+        libc::SIGIO => custom("IO"),
+        libc::SIGPROF => custom("PROF"),
+        libc::SIGSTOP => custom("STOP"),
+        libc::SIGSYS => custom("SYS"),
+        libc::SIGTRAP => custom("TRAP"),
+        libc::SIGTSTP => custom("TSTP"),
+        libc::SIGTTIN => custom("TTIN"),
+        libc::SIGTTOU => custom("TTOU"),
+        libc::SIGURG => custom("URG"),
+        libc::SIGUSR2 => custom("USR2"),
+        libc::SIGVTALRM => custom("VTALRM"),
+        libc::SIGWINCH => custom("WINCH"),
+        libc::SIGXCPU => custom("XCPU"),
+        libc::SIGXFSZ => custom("XFSZ"),
+        other => Sig::Custom(other.to_string()),
     }
 }
 
 /// How a shell's attendance ended.
 #[derive(Debug, PartialEq, Eq)]
 enum Attended {
-    /// The shell's side closed and it exited with this code, which the client is owed.
-    Exited(u32),
+    /// The child's side closed and it ended so, which the client is owed.
+    Exited(Exit),
     /// The connection ended first, so the pty was closed under the shell, and the shell has since exited.
     HungUp,
 }
@@ -419,7 +585,7 @@ where
     // Each arm's body runs only once both futures are gone, so on a hangup the pty is already closed by
     // the time the wait starts, and the wait can see the shell it hung up exit.
     tokio::select! {
-        _ = splice(pty, writer, reader, resize) => Attended::Exited(wait_code(child).await),
+        _ = splice(pty, writer, reader, resize) => Attended::Exited(wait_exit(child).await),
         () = hung_up(&mut hangup) => {
             reap(child).await;
             Attended::HungUp
@@ -428,8 +594,9 @@ where
 }
 
 /// Wait out [`HANGUP_GRACE`] for a hung-up shell, then kill its process group and wait for it. The shell
-/// leads its own session and group (the pty spawn makes it so), so the group is the shell and everything
-/// it started in the foreground; a job it detached into a group of its own is the holder's, and outlives it.
+/// leads its own session and group (the pty spawn and the pipe spawn both make it so), so the group is the
+/// shell and everything it started in the foreground; a job it detached into a group of its own is the
+/// holder's, and outlives it.
 async fn reap(mut child: tokio::process::Child) {
     if tokio::time::timeout(HANGUP_GRACE, child.wait())
         .await
@@ -446,20 +613,29 @@ async fn reap(mut child: tokio::process::Child) {
     let _ = child.wait().await;
 }
 
-/// A shell command whose child starts with the hangup, interrupt and quit signals at their defaults,
-/// whatever this process inherited. A serve started under `nohup`, or in the background of a
-/// non-interactive shell, ignores them, and an ignored disposition survives `exec`: its shells would then
-/// shrug off the very hangup that ends them when their connection goes.
-fn default_signals(command: Command) -> Command {
+/// A pty command whose child starts with its signals reset (see [`reset_signals`]).
+fn pty_signals(command: Command) -> Command {
     // SAFETY: the closure runs in the forked child before `exec`, where only async-signal-safe calls are
-    // allowed; `signal` is one, and it changes the child's dispositions only, never this process's.
+    // allowed; `reset_signals` makes only those.
     unsafe {
         command.pre_exec(|| {
-            for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
-                libc::signal(signal, libc::SIG_DFL);
-            }
+            reset_signals();
             Ok(())
         })
+    }
+}
+
+/// Put the hangup, interrupt and quit signals back at their defaults in a forked child, whatever this
+/// process inherited. A serve started under `nohup`, or in the background of a non-interactive shell,
+/// ignores them, and an ignored disposition survives `exec`: its children would then shrug off the very
+/// hangup that ends them when their connection goes.
+///
+/// Called between `fork` and `exec`, so it makes only async-signal-safe calls; `signal` is one, and it
+/// changes the calling process's dispositions only.
+fn reset_signals() {
+    for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+        // SAFETY: `signal` with a constant signal number and `SIG_DFL` is async-signal-safe and cannot fail.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
     }
 }
 
@@ -546,14 +722,9 @@ fn login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())
 }
 
-/// Wait for the shell to exit and map its status to an SSH exit code (0 if killed by a signal).
-async fn wait_code(mut child: tokio::process::Child) -> u32 {
-    child
-        .wait()
-        .await
-        .ok()
-        .and_then(|status| status.code())
-        .unwrap_or(0) as u32
+/// Wait for the shell to exit and say how it ended.
+async fn wait_exit(mut child: tokio::process::Child) -> Exit {
+    child.wait().await.map_or(Exit::Unknown, Exit::from)
 }
 
 /// Whether this process runs as the superuser. A shell served here runs as this uid, so root is refused.

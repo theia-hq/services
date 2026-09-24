@@ -14,6 +14,19 @@ admission, and the impl narrows it with `Served::into_rooted` before the body ru
 rooted proof, so "authorize before serve" is a compile-time precondition, not a check the caller remembers
 to write, and one admission authorizes exactly one connection.
 
+## Commands and terminals
+
+A command runs without a terminal unless the client asks for one (`ssh -t`), as with OpenSSH: on
+pipes, so input and output pass byte for byte, stderr stays apart from stdout, and the client's end of
+input reaches the command.
+
+The session ends when the command exits and its output is sent, whether or not the client closed its
+input. A command killed by a signal reports that signal, so the client exits non-zero. A command that
+asks for a password (`sudo`) needs `-t`, as with OpenSSH. A command that starts a background process
+keeps the session open until that process closes its output: start it with `</dev/null >/dev/null 2>&1 &`.
+
+A shell, or a command after `-t`, runs in a terminal.
+
 ## What it refuses
 
 - **Root.** A shell served to an admitted peer runs as this process's user, so a privileged process would
