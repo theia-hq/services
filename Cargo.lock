@@ -167,6 +167,7 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.6.1"
+source = "git+https://github.com/theia-hq/bifrost?rev=31107a0e7122bd25372c8c74ae8565f9e84f6827#31107a0e7122bd25372c8c74ae8565f9e84f6827"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -176,6 +177,7 @@ dependencies = [
 [[package]]
 name = "bifrost-core"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=31107a0e7122bd25372c8c74ae8565f9e84f6827#31107a0e7122bd25372c8c74ae8565f9e84f6827"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -188,6 +190,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mem"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=31107a0e7122bd25372c8c74ae8565f9e84f6827#31107a0e7122bd25372c8c74ae8565f9e84f6827"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -198,6 +201,7 @@ dependencies = [
 [[package]]
 name = "bifrost-transport"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=31107a0e7122bd25372c8c74ae8565f9e84f6827#31107a0e7122bd25372c8c74ae8565f9e84f6827"
 dependencies = [
  "bifrost-core",
  "tokio",
@@ -206,6 +210,7 @@ dependencies = [
 [[package]]
 name = "bifrost-wire"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=31107a0e7122bd25372c8c74ae8565f9e84f6827#31107a0e7122bd25372c8c74ae8565f9e84f6827"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -2946,6 +2951,7 @@ dependencies = [
 [[package]]
 name = "tightbeam-handler"
 version = "0.4.0"
+source = "git+https://github.com/theia-hq/tightbeam?rev=bd7670b1b35ff3b028f80d770f9d494b4e24b022#bd7670b1b35ff3b028f80d770f9d494b4e24b022"
 dependencies = [
  "bifrost-core",
  "nauthy",
@@ -3646,7 +3652,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "nauthy"
-version = "0.8.0"
