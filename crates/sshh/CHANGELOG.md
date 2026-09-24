@@ -3,21 +3,23 @@
 All notable changes to `sshh`, newest first. It carries its own version and its own cadence, so a
 release here moves `sshh` and nothing else in this repository.
 
-## Unreleased
+## v0.5.0
 
 ### Changed
-- **A command without a terminal runs on pipes, as OpenSSH runs it.** An exec the client asked no pty
-  for runs `sh -c <command>` on three pipes: input and output pass byte for byte, stderr arrives as
-  extended data, and the client's end of input closes the command's stdin. Before, every command ran in
-  a pty, which rewrote control bytes and line endings, echoed input, merged stderr into stdout, and
-  never passed end of input on, so a command reading its input to the end never finished. A shell, or
-  a command after a pty request (`ssh -t`), still runs in a pty.
-- **A piped command's session ends when the command does**, once its output is sent, without waiting
-  for the client to close its input.
-- **A piped command leads a session of its own with no controlling terminal**, so it cannot open
-  `/dev/tty`, and a cut sends its process group SIGHUP.
-- **A command killed by a signal reports `exit-signal`**, on both paths, instead of exit status 0.
-- Builds against tightbeam v0.14.1's handler contract. The contract itself is unchanged.
+- **A command run without a terminal gets pipes, as with OpenSSH.** When the client asks for no pty,
+  sshh runs `sh -c <command>` with plain pipes for stdin, stdout and stderr. Bytes pass through
+  unchanged, stderr arrives as stderr, and when the client ends its input the command sees end of
+  input. Before, every command ran in a pty: control bytes and line endings were rewritten, input was
+  echoed, stderr was mixed into stdout, and a command that read its input to the end never finished. A
+  shell, or a command run with `ssh -t`, still gets a pty.
+- **A command's session ends when the command exits**, once its output is sent. The client no longer
+  has to close its input first.
+- **A command runs in a session of its own with no terminal**, so it cannot open `/dev/tty`. When the
+  node cuts the session, the command's process group gets SIGHUP.
+- **A command killed by a signal reports that signal** (`exit-signal`), with or without a pty. Before,
+  it reported exit status 0.
+- Builds against tightbeam v0.15.0's handler contract, nauthy v0.7.0 and bifrost v0.6.1. The
+  contract itself is unchanged.
 
 ## v0.4.0
 

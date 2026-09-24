@@ -11,4 +11,5 @@ in lockstep rather than earned alone, and that stands.
 ## Unreleased
 
 ### Changed
-- Builds against tightbeam v0.14.1's handler contract. The contract itself is unchanged.
+- Builds against tightbeam v0.15.0's handler contract, nauthy v0.7.0 and bifrost v0.6.1. The
+  contract itself is unchanged.
