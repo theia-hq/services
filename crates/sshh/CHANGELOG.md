@@ -6,6 +6,17 @@ release here moves `sshh` and nothing else in this repository.
 ## Unreleased
 
 ### Changed
+- **A command without a terminal runs on pipes, as OpenSSH runs it.** An exec the client asked no pty
+  for runs `sh -c <command>` on three pipes: input and output pass byte for byte, stderr arrives as
+  extended data, and the client's end of input closes the command's stdin. Before, every command ran in
+  a pty, which rewrote control bytes and line endings, echoed input, merged stderr into stdout, and
+  never passed end of input on, so a command reading its input to the end never finished. A shell, or
+  a command after a pty request (`ssh -t`), still runs in a pty.
+- **A piped command's session ends when the command does**, once its output is sent, without waiting
+  for the client to close its input.
+- **A piped command leads a session of its own with no controlling terminal**, so it cannot open
+  `/dev/tty`, and a cut sends its process group SIGHUP.
+- **A command killed by a signal reports `exit-signal`**, on both paths, instead of exit status 0.
 - Builds against tightbeam v0.14.1's handler contract. The contract itself is unchanged.
 
 ## v0.4.0
