@@ -3,7 +3,7 @@
 All notable changes to `transfer`, newest first. It carries its own version and its own cadence, so a
 release here moves `transfer` and nothing else in this repository.
 
-## Unreleased
+## v0.6.1
 
 ### Changed
 - Builds against tightbeam v0.17.1.
