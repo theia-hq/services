@@ -3,6 +3,13 @@
 All notable changes to `sshh`, newest first. It carries its own version and its own cadence, so a
 release here moves `sshh` and nothing else in this repository.
 
+## v0.8.0
+
+### Changed
+- Builds against tightbeam v0.18.0's handler contract and nauthy v0.11.0. The contract itself is
+  unchanged, but the nauthy types it names come from the new release, so a consumer must pin that
+  same release.
+
 ## v0.7.1
 
 ### Changed
