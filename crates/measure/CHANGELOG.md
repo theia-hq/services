@@ -3,6 +3,15 @@
 All notable changes to `measure`, newest first. It carries its own version and its own cadence, so a
 release here moves `measure` and nothing else in this repository.
 
+## v0.6.0
+
+### Changed
+- Builds against tightbeam v0.17.0's handler contract, nauthy v0.10.0 and bifrost v0.8.0. The
+  contract itself is unchanged, but the sibling types it names come from the new releases, so a
+  consumer must pin those same releases.
+- `Speedtest::run`, `Ping::run` and `Ping::observing` take bifrost v0.8.0's `Session`, and
+  `ProtocolError` converts from bifrost v0.8.0's `Error`.
+
 ## v0.5.0
 
 ### Changed
