@@ -8,6 +8,11 @@ number, and those entries are about the set rather than about any one engine, so
 [repository changelog](../../CHANGELOG.md). `fetch` starts from the v0.3.0 it holds today, reached
 in lockstep rather than earned alone, and that stands.
 
+## Unreleased
+
+### Changed
+- Builds against tightbeam v0.17.1.
+
 ## v0.5.0
 
 ### Changed
