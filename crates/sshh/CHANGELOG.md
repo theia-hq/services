@@ -3,6 +3,11 @@
 All notable changes to `sshh`, newest first. It carries its own version and its own cadence, so a
 release here moves `sshh` and nothing else in this repository.
 
+## v0.7.1
+
+### Changed
+- Builds against tightbeam v0.17.1.
+
 ## v0.7.0
 
 ### Changed
