@@ -19,7 +19,7 @@ nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "a9e8424d99fdd41d10
 # The lean handler contract in tightbeam's repo, pinned from the same repo as tightbeam itself. The pin
 # moves with the extraction commit in the family cascade; the same nauthy rev must resolve across services,
 # tightbeam-handler, and tightbeam or the witness types do not match at compile time.
-tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "f7f3e5db7ec70da28d54a54c9cbc9a4978fec30c" }
+tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "a165b59436fa9262ab86c535957413fe52c01ef6" }
 
 eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
