@@ -717,16 +717,16 @@ mod server_tests {
         /// A rooted admission witness, the only kind an owner engine's `Never` ceiling admits. Minted
         /// through the gate, the same mint a dispatcher uses, so these drive the real serving path.
         fn witness() -> nauthy::Admitted {
-            let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+            let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
             let peer = nauthy::Identity::from_secret(&[5u8; 32])
                 .expect("valid secret")
                 .verifying_key();
             let service: nauthy::Service = "ping".parse().expect("valid service name");
-            let badge = signet
+            let badge = root
                 .mint_member(peer, nauthy::Request::expires_in(Duration::from_secs(300)))
                 .expect("mint a member badge");
             nauthy::Gate::rooted(
-                signet.verifying_key(),
+                root.verifying_key(),
                 nauthy::FileDenylist::empty(std::env::temp_dir().join("measure-typed-door")),
             )
             .admit_witnessed(

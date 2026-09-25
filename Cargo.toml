@@ -15,11 +15,11 @@ license = "MIT OR Apache-2.0"
 # from GitHub. All bifrost-* crates live in one repo, so they share one rev.
 bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
 bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "a9e8424d99fdd41d10be26b5ddb3cec6c1c41ce6" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "3adae5a19487781b944e2a4ca4361227b0ba8dcc" }
 # The lean handler contract in tightbeam's repo, pinned from the same repo as tightbeam itself. The pin
 # moves with the extraction commit in the family cascade; the same nauthy rev must resolve across services,
 # tightbeam-handler, and tightbeam or the witness types do not match at compile time.
-tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "a165b59436fa9262ab86c535957413fe52c01ef6" }
+tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "91dac6bab309c77af0d21af828cdd1f810739aca" }
 
 eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }

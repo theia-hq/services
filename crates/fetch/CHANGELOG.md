@@ -8,6 +8,13 @@ number, and those entries are about the set rather than about any one engine, so
 [repository changelog](../../CHANGELOG.md). `fetch` starts from the v0.3.0 it holds today, reached
 in lockstep rather than earned alone, and that stands.
 
+## v0.6.0
+
+### Changed
+- Builds against tightbeam v0.18.0's handler contract and nauthy v0.11.0. The contract itself is
+  unchanged, but the nauthy types it names come from the new release, so a consumer must pin that
+  same release.
+
 ## v0.5.1
 
 ### Changed
