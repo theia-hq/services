@@ -727,7 +727,8 @@ mod server_tests {
                 .expect("mint a member badge");
             nauthy::Gate::rooted(
                 root.verifying_key(),
-                nauthy::FileDenylist::empty(std::env::temp_dir().join("measure-typed-door")),
+                nauthy::Denylist::load(std::env::temp_dir().join("measure-typed-door"))
+                    .expect("an absent denylist loads empty"),
             )
             .admit_witnessed(
                 nauthy::ProvenPeer::from_handshake(peer),
