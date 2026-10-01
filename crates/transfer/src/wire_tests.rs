@@ -1,6 +1,6 @@
 use tokio::io;
 
-use super::{Blob, Error, MAX_HEADER_LEN, Transfer};
+use super::{ACK_DEADLINE, Blob, Error, MAX_HEADER_LEN, Transfer};
 
 /// Receive one frame the way a receiver that keeps nothing does: read its head, take its body into `sink`,
 /// and answer from the result. Returns the sender's header.
@@ -280,5 +280,86 @@ async fn a_receiver_answers_zero_to_a_body_that_does_not_match_its_root() {
         .expect_err("a changed body is refused");
 
     assert!(matches!(error, Error::IntegrityFailed), "{error}");
+    assert_eq!(answer, [0]);
+}
+
+/// The length of the golden frame's head: everything before the body.
+const GOLDEN_HEAD_LEN: usize = 4 + 4 + 8 + 8 + 32;
+
+/// A receiver that takes the whole frame and never answers cannot hold the sender: the wait for the
+/// answer has a deadline, and passing it is its own error. The outer bound only keeps the test finite
+/// when the deadline is gone, which is how it then fails.
+#[tokio::test(start_paused = true)]
+async fn a_sender_stops_waiting_for_an_answer_that_never_comes() {
+    let blob = Blob::hash(&mut &*GOLDEN_BODY)
+        .await
+        .expect("the blob hashes");
+    let (sender, receiver) = io::duplex(64 * 1024);
+    let (sender_read, sender_write) = io::split(sender);
+
+    let mut source = GOLDEN_BODY;
+    let sending = Transfer::new(sender_write, sender_read).send(GOLDEN_HEADER, &blob, &mut source);
+    let outcome = tokio::time::timeout(ACK_DEADLINE * 2, sending).await;
+    drop(receiver);
+
+    assert!(
+        matches!(outcome, Ok(Err(Error::AckTimeout))),
+        "the sender gives up on its own deadline: {outcome:?}"
+    );
+}
+
+/// A source that grew after it was hashed is refused, and the receiver never gets the last byte of
+/// the declared body, so the frame it holds is short and nothing can be kept from it.
+#[tokio::test]
+async fn a_sender_refuses_a_longer_source_before_the_last_byte() {
+    let blob = Blob::hash(&mut &*GOLDEN_BODY)
+        .await
+        .expect("the blob hashes");
+
+    let mut written = Vec::new();
+    let error = Transfer::new(&mut written, [1u8].as_slice())
+        .send(GOLDEN_HEADER, &blob, &mut b"payload and more".as_slice())
+        .await
+        .expect_err("a longer source is refused");
+
+    assert!(matches!(error, Error::LengthMismatch), "{error}");
+    assert!(
+        written.len() < GOLDEN_HEAD_LEN + GOLDEN_BODY.len(),
+        "the declared body was never completed on the wire: {} bytes written",
+        written.len()
+    );
+}
+
+/// An empty blob has no last byte to hold back, so a source that is no longer empty is refused before
+/// any byte of the frame is written.
+#[tokio::test]
+async fn a_sender_refuses_a_non_empty_source_for_an_empty_blob_before_the_frame() {
+    let blob = Blob::hash(&mut b"".as_slice())
+        .await
+        .expect("the blob hashes");
+
+    let mut written = Vec::new();
+    let error = Transfer::new(&mut written, [1u8].as_slice())
+        .send(GOLDEN_HEADER, &blob, &mut b"x".as_slice())
+        .await
+        .expect_err("a non-empty source is refused");
+
+    assert!(matches!(error, Error::LengthMismatch), "{error}");
+    assert!(written.is_empty(), "nothing reaches the wire");
+}
+
+/// A frame that runs past its declared body is refused even though the body verifies, and the
+/// receiver answers `0`: a stream that is not done is not a whole blob.
+#[tokio::test]
+async fn a_receiver_refuses_a_stream_that_runs_past_the_body() {
+    let mut frame = golden_frame();
+    frame.push(b'!');
+
+    let mut answer = Vec::new();
+    let error = receive(&mut answer, frame.as_slice(), &mut Vec::new())
+        .await
+        .expect_err("a byte past the body is refused");
+
+    assert!(matches!(error, Error::Overrun), "{error}");
     assert_eq!(answer, [0]);
 }

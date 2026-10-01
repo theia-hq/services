@@ -366,6 +366,64 @@ async fn a_refused_name_is_refused_before_the_output_directory_is_opened() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A file that grew between the sender's hash and its send never lands: the sender refuses the longer
+/// source before the declared body is complete, so the receiver reads a short body, and both ends fail.
+#[tokio::test]
+async fn a_source_that_grew_after_hashing_never_lands() {
+    let out = fresh_dir("grown");
+
+    let (received, sent) =
+        exchange_changed(&out, b"log.txt", b"line one\n", b"line one\nline two\n").await;
+
+    assert!(
+        matches!(sent, Err(wire::Error::LengthMismatch)),
+        "the sender refuses the longer source: {sent:?}"
+    );
+    assert!(
+        matches!(
+            received,
+            Err(ReceiveError::Transfer(wire::Error::Truncated))
+        ),
+        "the receiver never saw a whole body: {received:?}"
+    );
+    assert!(!out.join("log.txt").exists(), "nothing lands");
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A frame that runs past its declared body is refused and answered no, though its body verifies:
+/// the receiver requires the stream to end with the body before it keeps anything.
+#[tokio::test]
+async fn a_stream_that_runs_past_the_body_never_lands() {
+    let out = fresh_dir("overrun");
+    let blob = Blob::hash(&mut b"PUSHED".as_slice())
+        .await
+        .expect("the blob hashes");
+    // The real sender writes the frame; one byte after it is what a sender that streamed on would add.
+    let mut frame = Vec::new();
+    Transfer::new(&mut frame, [1u8].as_slice())
+        .send(b"pushed", &blob, &mut b"PUSHED".as_slice())
+        .await
+        .expect("the frame is written");
+    frame.push(b'!');
+
+    let mut answer = Vec::new();
+    let error = receive_file(&mut answer, frame.as_slice(), &out, 0)
+        .await
+        .expect_err("a byte past the body is refused");
+
+    assert!(
+        matches!(error, ReceiveError::Transfer(wire::Error::Overrun)),
+        "{error:?}"
+    );
+    assert_eq!(answer, [0], "the sender is answered no");
+    assert!(!out.join("pushed").exists(), "nothing lands");
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 /// The landing for a filesystem with no exclusive rename, driven directly so it runs on every filesystem:
 /// it lands a new name and refuses an existing file and a symlink, keeping the temp for its caller.
 #[cfg(unix)]
@@ -472,16 +530,28 @@ async fn exchange(
     header: &[u8],
     payload: &[u8],
 ) -> (Result<Received, ReceiveError>, Result<(), wire::Error>) {
+    exchange_changed(out, header, payload, payload).await
+}
+
+/// One push whose source held `hashed` when the sender hashed it and `sent` when it streamed it, as a
+/// file written to between the two reads does.
+async fn exchange_changed(
+    out: &Path,
+    header: &[u8],
+    hashed: &[u8],
+    sent: &[u8],
+) -> (Result<Received, ReceiveError>, Result<(), wire::Error>) {
     let (sender, receiver) = io::duplex(64 * 1024);
     let (sender_read, sender_write) = io::split(sender);
     let (receiver_read, receiver_write) = io::split(receiver);
 
     let header = header.to_vec();
-    let payload = payload.to_vec();
+    let (hashed, sent) = (hashed.to_vec(), sent.to_vec());
     let sending = tokio::spawn(async move {
-        let mut source = payload.as_slice();
-        let blob = Blob::hash(&mut source).await.expect("the blob hashes");
-        let mut source = payload.as_slice();
+        let blob = Blob::hash(&mut hashed.as_slice())
+            .await
+            .expect("the blob hashes");
+        let mut source = sent.as_slice();
         Transfer::new(sender_write, sender_read)
             .send(&header, &blob, &mut source)
             .await
