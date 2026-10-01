@@ -143,6 +143,34 @@ async fn a_push_through_a_symlinked_dir_that_leads_out_is_refused() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A symlink that leads out is refused before anything is made under it: a push naming new directories
+/// past it leaves the outside untouched, not even an empty directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_push_creates_no_directory_outside_the_output_directory() {
+    let root = fresh_dir("no-dir-out");
+    let out = root.join("out");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&out).expect("the output directory is creatable");
+    std::fs::create_dir_all(&elsewhere).expect("the outside directory is creatable");
+    std::os::unix::fs::symlink(&elsewhere, out.join(".linked")).expect("the symlink is creatable");
+
+    let error = push(&out, b".linked/new/deep/settings", b"ESCAPED")
+        .await
+        .expect_err("a directory that leads out is refused");
+
+    assert!(
+        matches!(error, ReceiveError::Escapes { .. }),
+        "refused as leading out: {error:?}"
+    );
+    assert!(
+        !elsewhere.join("new").exists(),
+        "no directory is created outside the output directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A sender cannot name the receiver's temp file pattern, at the top or nested, so it can never aim a
 /// landing at another stream's in-flight temp.
 #[tokio::test]

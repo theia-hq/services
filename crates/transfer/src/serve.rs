@@ -90,29 +90,12 @@ async fn land(temp: &Path, out: &Path, header: &[u8]) -> Result<PathBuf, Receive
         });
     }
 
-    if let Some(parent) = final_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| ReceiveError::CreateDir {
-                path: render_path(parent),
-                source,
-            })?;
-        // `safe_relative_path` strips `..` and roots, but a directory already inside `out` may be a
-        // symlink that leads out of it, and the kernel follows it. Comparing canonical forms is the check
-        // that holds whatever the path's spelling.
-        let root = canonical(out).await?;
-        let resolved = canonical(parent).await?;
-        if !resolved.starts_with(&root) {
-            return Err(ReceiveError::Escapes {
-                path: render_path(&final_path),
-            });
-        }
-    }
+    let landing = contained_path(out, &relative, &final_path).await?;
 
     // A hard link is the landing because it refuses an existing name, where a rename replaces it: a push
     // may only add a file, never rewrite one the receiver already holds. A symlink at the final name is an
     // existing name too, so it is refused rather than replaced or followed.
-    match tokio::fs::hard_link(temp, &final_path).await {
+    match tokio::fs::hard_link(temp, &landing).await {
         Ok(()) => Ok(relative),
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Err(ReceiveError::Exists {
             path: render_path(&final_path),
@@ -122,6 +105,51 @@ async fn land(temp: &Path, out: &Path, header: &[u8]) -> Result<PathBuf, Receive
             source,
         }),
     }
+}
+
+/// Make the directories `relative` names under `out` and return where its file lands, never creating or
+/// resolving anything outside `out`.
+///
+/// `safe_relative_path` strips `..` and roots, but a directory already inside `out` may be a symlink that
+/// leads out of it, and the kernel follows it. So the walk goes one directory at a time: each is created
+/// if missing (never through a symlink, which `mkdir` treats as an existing name), then canonicalized and
+/// held under the canonical `out` before the next is made inside it. A symlink that leads out is refused
+/// before anything is created under it, and the file lands under the last canonical directory, so no later
+/// spelling of the path is followed again.
+async fn contained_path(
+    out: &Path,
+    relative: &Path,
+    final_path: &Path,
+) -> Result<PathBuf, ReceiveError> {
+    let root = canonical(out).await?;
+    let mut directories = relative.components();
+    // `safe_relative_path` never returns an empty path. Were it to, the landing would name `out` itself,
+    // which the link refuses as existing.
+    let Some(name) = directories.next_back() else {
+        return Ok(root);
+    };
+    let mut dir = root.clone();
+    for directory in directories {
+        let next = dir.join(directory);
+        match tokio::fs::create_dir(&next).await {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(ReceiveError::CreateDir {
+                    path: render_path(&next),
+                    source,
+                });
+            }
+        }
+        let resolved = canonical(&next).await?;
+        if !resolved.starts_with(&root) {
+            return Err(ReceiveError::Escapes {
+                path: render_path(final_path),
+            });
+        }
+        dir = resolved;
+    }
+    Ok(dir.join(name))
 }
 
 /// Resolve `path` to its canonical form, every symlink followed, for the containment check.
@@ -191,7 +219,8 @@ pub enum ReceiveError {
         #[source]
         source: io::Error,
     },
-    /// The destination's parent directory could not be resolved to its canonical form.
+    /// The output directory, or a directory on the way to the destination, could not be resolved to its
+    /// canonical form.
     #[error("resolve {path}: {source}")]
     Resolve {
         /// The directory, rendered for a log line.
