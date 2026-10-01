@@ -19,11 +19,15 @@ use tokio::io::{self, AsyncWriteExt as _};
 
 use crate::wire::{Blob, Incoming, Transfer};
 
-/// Receive one pushed file over an admitted stream: stream it into a fresh temp file under `out`, verify it
-/// end to end (the [`wire`](crate::wire) checks every byte against the sender's BLAKE3 root), land it at the
-/// safe relative path the sender named, and only then answer the sender. On any failure, and when the
-/// returned future is dropped mid-stream, the temp file is removed, so a rejected, truncated or abandoned
-/// transfer never leaves a partial file behind.
+/// Receive one pushed file over an admitted stream: read the frame's head, stream the body into a fresh temp
+/// file under `out`, verify it end to end (the [`wire`](crate::wire) checks every byte against the sender's
+/// BLAKE3 root), land it at the safe relative path the sender named, and only then answer the sender. On
+/// any failure, and when the returned future is dropped mid-stream, the temp file is removed, so a
+/// rejected, truncated or abandoned transfer never leaves a partial file behind.
+///
+/// Nothing is spent on a stream before its head is read: the output directory is opened and the temp made
+/// only for a frame that is ours and names a landing the receiver could make. A stream that stays silent,
+/// is not ours, or names a refused path costs no descriptor and no disk, and its body is never written.
 ///
 /// The answer comes last because it is the sender's only word on the push: a sender told yes before the
 /// landing would report a file as delivered that a refusal then threw away, while another push held its
@@ -45,6 +49,24 @@ where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
+    let mut incoming = Transfer::new(writer, reader).recv().await?;
+    let landed = land(&mut incoming, out, tag).await;
+    incoming.answer(landed).await
+}
+
+/// Every step between reading the frame's head and answering the sender, so that the answer is made from
+/// one outcome: refuse the name, make the temp, take the body into it, then land it under `out`.
+async fn land<W, R>(
+    incoming: &mut Incoming<W, R>,
+    out: &Path,
+    tag: u64,
+) -> Result<Received, ReceiveError>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let landing = Landing::parse(incoming.header(), out)?;
+
     // Each filesystem step is a blocking syscall, so it runs on the blocking pool. Were this future dropped
     // while one runs, the step still finishes and its `Temp` drops there, which removes the temp.
     let opening = out.to_path_buf();
@@ -55,23 +77,6 @@ where
             source: io::Error::other(joined),
         })??;
 
-    let mut incoming = Transfer::new(writer, reader).recv().await?;
-    let landed = land(&mut incoming, out, temp, file).await;
-    incoming.answer(landed).await
-}
-
-/// Take the incoming blob's body into `temp`, then land it under `out`: every step between reading the
-/// frame's head and answering the sender, so that the answer is made from one outcome.
-async fn land<W, R>(
-    incoming: &mut Incoming<W, R>,
-    out: &Path,
-    temp: Temp,
-    file: std::fs::File,
-) -> Result<Received, ReceiveError>
-where
-    W: io::AsyncWrite + Unpin,
-    R: io::AsyncRead + Unpin,
-{
     let mut file = tokio::fs::File::from_std(file);
     incoming.verify_into(&mut file).await?;
     file.flush().await.map_err(|source| ReceiveError::Flush {
@@ -82,7 +87,6 @@ where
     drop(file);
 
     let blob = *incoming.blob();
-    let landing = Landing::parse(incoming.header(), out)?;
     let final_path = out.join(&landing.relative);
     let path = tokio::task::spawn_blocking(move || temp.land(landing, &blob))
         .await
@@ -98,7 +102,7 @@ where
 
 /// Where a sender asked a file to land: its header reduced to a safe relative path, with every refusal
 /// that depends only on the name already made. Parsing it first means a refused push creates nothing,
-/// not even a directory inside the output directory.
+/// not even the temp, and its body is never written.
 struct Landing {
     /// The safe relative path the file lands at under the output directory.
     relative: PathBuf,

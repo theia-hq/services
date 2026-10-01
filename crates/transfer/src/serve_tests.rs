@@ -277,24 +277,38 @@ async fn a_refused_push_makes_no_directory() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
-/// A push dropped mid-stream, as a caller's deadline drops a silent stream, leaves no temp behind.
+/// A push dropped mid-stream, as a caller's deadline drops a stalled stream, leaves no temp behind. The
+/// sender writes the frame's head and then stalls on a source that never ends, so the temp exists when
+/// the receive is dropped.
 #[tokio::test]
 async fn an_abandoned_push_leaves_no_temp() {
     let out = fresh_dir("abandoned");
-    let (silent, receiver) = io::duplex(64 * 1024);
+    let (sender, receiver) = io::duplex(64 * 1024);
+    let (sender_read, sender_write) = io::split(sender);
     let (receiver_read, receiver_write) = io::split(receiver);
+    // The far end of the source is held open and never written, so the body never arrives.
+    let (held, mut endless) = io::duplex(1);
 
+    let blob = Blob::hash(&mut b"payload".as_slice())
+        .await
+        .expect("the blob hashes");
+    let sending = tokio::spawn(async move {
+        Transfer::new(sender_write, sender_read)
+            .send(b"stalled", &blob, &mut endless)
+            .await
+    });
     let receiving = {
         let out = out.clone();
         tokio::spawn(async move { receive_file(receiver_write, receiver_read, &out, 0).await })
     };
     assert!(
         eventually(|| temps_in(&out) == 1).await,
-        "the receive makes its temp before the first byte"
+        "the receive makes its temp once the head is read"
     );
     receiving.abort();
     let _ = receiving.await;
-    drop(silent);
+    sending.abort();
+    drop(held);
 
     assert!(
         eventually(|| temps_in(&out) == 0).await,
@@ -302,6 +316,54 @@ async fn an_abandoned_push_leaves_no_temp() {
     );
 
     let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A stream that says nothing costs the receiver nothing on disk: the output directory is opened and the
+/// temp made only once a frame's head is read, so a silent stream leaves the directory empty.
+#[tokio::test]
+async fn a_silent_stream_spends_no_disk() {
+    let out = fresh_dir("silent");
+    let (silent, receiver) = io::duplex(64 * 1024);
+    let (receiver_read, receiver_write) = io::split(receiver);
+
+    let receiving = {
+        let out = out.clone();
+        tokio::spawn(async move { receive_file(receiver_write, receiver_read, &out, 0).await })
+    };
+    // A temp made before the head appears within milliseconds; this waits far longer than that.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let made = std::fs::read_dir(&out)
+        .expect("the output directory lists")
+        .count();
+    receiving.abort();
+    let _ = receiving.await;
+    drop(silent);
+
+    assert_eq!(
+        made, 0,
+        "nothing is made for a stream that has said nothing"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A name refused from the frame's head is refused before the output directory is even opened: the
+/// refusal holds where that directory does not exist, so it spent no descriptor and no disk.
+#[tokio::test]
+async fn a_refused_name_is_refused_before_the_output_directory_is_opened() {
+    let root = fresh_dir("refused-unopened");
+    let out = root.join("absent");
+
+    let error = push(&out, b".transfer-0123456789abcdef.part", b"PLANTED")
+        .await
+        .expect_err("a temp file name is refused");
+
+    assert!(
+        matches!(error, ReceiveError::TempName { .. }),
+        "refused for its name, not for the directory: {error:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The landing for a filesystem with no exclusive rename, driven directly so it runs on every filesystem:
