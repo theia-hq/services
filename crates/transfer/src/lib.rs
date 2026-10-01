@@ -9,8 +9,8 @@
 //!
 //! It is a service crate: it knows what to DO with an admitted stream, never how the peer was reached or
 //! gated. The composing consumer binds [`Recv`](crate::Recv) into its route table, so every pushed file rides
-//! the same family gate as every other service; the sender side (dial, expand directories, pipeline
-//! concurrent streams) is a client verb driving [`wire::Transfer::send`].
+//! the same family gate as every other service; the sender side (dial, walk a directory, run streams in
+//! parallel) is the caller's, driving [`wire::Transfer::send`].
 //!
 //! One stream carries one file. The exposer accepts a sender's per-file streams concurrently, so a
 //! directory's files land in parallel with no fan-out logic here: each invocation is one file, start to

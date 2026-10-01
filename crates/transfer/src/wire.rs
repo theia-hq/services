@@ -129,8 +129,8 @@ const ACK_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const BROKEN_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// A content-addressed blob descriptor: its BLAKE3 root and length. The receiver checks the bytes it
-/// got against the root, which catches a body corrupted or changed in transit; it proves nothing about
-/// who sent them, since the sender computes the root.
+/// got against the root, which catches a body corrupted on the way or changed while it was sent; it
+/// proves nothing about who sent them, since the sender computes the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Blob {
     root: [u8; 32],
@@ -182,7 +182,7 @@ impl Blob {
     }
 }
 
-/// A verified blob transfer over one bidirectional byte-stream pair.
+/// A blob transfer over one bidirectional byte-stream pair.
 ///
 /// Owns the stream halves and is consumed by [`Transfer::send`], or on the receiving side by this crate's
 /// own receiver: one transfer, one blob, one pair.
