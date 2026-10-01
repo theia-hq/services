@@ -2,6 +2,7 @@ use core::time::Duration;
 use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 
+use nauthy::VerifyKey;
 use rustix::io::Errno;
 use tokio::io;
 
@@ -70,7 +71,8 @@ async fn a_landing_failure_reports_the_path_escaped() {
 }
 
 /// A push lands as a new file at the name the sender gave, hidden components and all: a directory push
-/// carries dotfiles, so a leading dot is not a refusal. No temp file is left beside it.
+/// carries dotfiles, so a leading dot is not a refusal. It is reported with the sender's admitted key, and
+/// no temp file is left beside it.
 #[tokio::test]
 async fn a_push_lands_as_a_new_file() {
     let out = fresh_dir("lands");
@@ -81,6 +83,11 @@ async fn a_push_lands_as_a_new_file() {
 
     assert_eq!(received.path, Path::new(".config/app/settings"));
     assert_eq!(received.bytes, 6);
+    assert_eq!(
+        received.from,
+        pusher(),
+        "the file names the key that pushed it"
+    );
     assert_eq!(
         std::fs::read(out.join(".config/app/settings")).expect("the landed file reads"),
         b"PUSHED"
@@ -299,7 +306,9 @@ async fn an_abandoned_push_leaves_no_temp() {
     });
     let receiving = {
         let out = out.clone();
-        tokio::spawn(async move { receive_file(receiver_write, receiver_read, &out, 0).await })
+        tokio::spawn(
+            async move { receive_file(receiver_write, receiver_read, &out, 0, pusher()).await },
+        )
     };
     assert!(
         eventually(|| temps_in(&out) == 1).await,
@@ -328,7 +337,9 @@ async fn a_silent_stream_spends_no_disk() {
 
     let receiving = {
         let out = out.clone();
-        tokio::spawn(async move { receive_file(receiver_write, receiver_read, &out, 0).await })
+        tokio::spawn(
+            async move { receive_file(receiver_write, receiver_read, &out, 0, pusher()).await },
+        )
     };
     // A temp made before the head appears within milliseconds; this waits far longer than that.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -409,7 +420,7 @@ async fn a_stream_that_runs_past_the_body_never_lands() {
     frame.push(b'!');
 
     let mut answer = Vec::new();
-    let error = receive_file(&mut answer, frame.as_slice(), &out, 0)
+    let error = receive_file(&mut answer, frame.as_slice(), &out, 0, pusher())
         .await
         .expect_err("a byte past the body is refused");
 
@@ -620,9 +631,16 @@ async fn exchange_changed(
             .await
     });
 
-    let received = receive_file(receiver_write, receiver_read, out, 0).await;
+    let received = receive_file(receiver_write, receiver_read, out, 0, pusher()).await;
     let sent = sending.await.expect("the sender task completes");
     (received, sent)
+}
+
+/// The key every test push is admitted under, as the gate hands it to the engine.
+fn pusher() -> VerifyKey {
+    nauthy::Identity::from_secret(&[7; 32])
+        .expect("a valid secret")
+        .verifying_key()
 }
 
 /// No temp file is left under `out` at its top level, where every temp is made.

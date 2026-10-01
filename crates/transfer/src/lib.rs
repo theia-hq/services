@@ -4,7 +4,8 @@
 //! [`wire::Transfer`] to the receiver. The rest of this crate is that receiver's per-stream work: read one
 //! blob off an admitted stream, check it against the root the sender sent, and save it under an output
 //! directory, reducing the sender-supplied name to a safe relative path so a peer can never write outside
-//! that directory.
+//! that directory. Each saved file is reported with the key the gate admitted its sender under, which is
+//! what says who sent it; the root only says the bytes arrived as the sender read them.
 //!
 //! It is a service crate: it knows what to DO with an admitted stream, never how the peer was reached or
 //! gated. The composing consumer binds [`Recv`](crate::Recv) into its route table, so every pushed file rides

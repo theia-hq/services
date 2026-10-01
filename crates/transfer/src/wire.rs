@@ -1,8 +1,11 @@
-//! The transfer wire: verified blob transfer over any byte stream.
+//! The transfer wire: one-shot blob transfer over any byte stream, checked end to end.
 //!
 //! Pure bytes. A [`Transfer`] owns one bidirectional stream pair and is consumed to move a single
-//! [`Blob`] across it, proving the bytes against their BLAKE3 root so a peer cannot lie about content
-//! and a truncated transfer is rejected. It knows nothing about files, paths, filenames, iroh, QUIC,
+//! [`Blob`] across it. The sender states the blob's length and BLAKE3 root ahead of its bytes, and the
+//! receiver checks what arrived against both, so a body corrupted on the way, cut short, or changed
+//! while it was sent is refused. The root does not say who wrote the bytes: the sender names the root
+//! of whatever it sends, so the sender's identity is the transport's proof and the gate's, never this
+//! wire's. It knows nothing about files, paths, filenames, iroh, QUIC,
 //! or sockets: sources and sinks are any [`AsyncRead`]/[`AsyncWrite`] the caller supplies, and an
 //! opaque `header` carries whatever application metadata the caller wants (a filename, a content
 //! type), transmitted verbatim and never interpreted here.
@@ -125,8 +128,9 @@ const ACK_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// before the break and arrives with it; this only has to outlast that delivery.
 const BROKEN_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
-/// A content-addressed blob descriptor: its BLAKE3 root and length. The root names the bytes, so
-/// anyone can verify what they received against it and the source cannot lie about content.
+/// A content-addressed blob descriptor: its BLAKE3 root and length. The receiver checks the bytes it
+/// got against the root, which catches a body corrupted or changed in transit; it proves nothing about
+/// who sent them, since the sender computes the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Blob {
     root: [u8; 32],

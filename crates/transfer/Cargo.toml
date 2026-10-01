@@ -10,6 +10,7 @@ repository = "https://github.com/theia-hq/services"
 
 [dependencies]
 # siblings
+nauthy.workspace = true
 tightbeam-handler.workspace = true
 
 blake3 = "1"
