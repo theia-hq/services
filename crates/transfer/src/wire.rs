@@ -99,9 +99,9 @@ impl core::fmt::Display for WireVersion {
         write!(f, "{}{}", IDENTITY.escape_ascii(), self.0.escape_ascii())
     }
 }
-/// The receiver accepted and verified the blob.
+/// The receiver verified the blob and finished with it (a receiver that saves it has saved it).
 const ACK_OK: u8 = 1;
-/// The receiver rejected the blob (for example, an integrity failure).
+/// The receiver refused the blob at some step: it did not verify, or the receiver would not keep it.
 const ACK_ERR: u8 = 0;
 /// Streaming buffer size.
 const CHUNK: usize = 64 * 1024;
@@ -146,16 +146,17 @@ impl Blob {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-}
 
-/// A received blob: its opaque header and verified descriptor. The payload has already been written
-/// to the caller's sink.
-#[derive(Debug, Clone)]
-pub(crate) struct Received {
-    /// The opaque, app-defined header the sender attached.
-    pub(crate) header: Vec<u8>,
-    /// The verified descriptor of the received bytes.
-    pub(crate) blob: Blob,
+    /// Whether `bytes`, `len` bytes long, are exactly this blob. The length is compared first, so a
+    /// short claim never makes the caller hash a large file; a reader that runs past `len` is cut there.
+    pub(crate) fn describes(&self, len: u64, bytes: impl std::io::Read) -> std::io::Result<bool> {
+        if len != self.len {
+            return Ok(false);
+        }
+        let mut hasher = blake3::Hasher::new();
+        let read = std::io::copy(&mut bytes.take(len), &mut hasher)?;
+        Ok(read == len && hasher.finalize().as_bytes() == &self.root)
+    }
 }
 
 /// A verified blob transfer over one bidirectional byte-stream pair.
@@ -219,19 +220,15 @@ where
         Ok(())
     }
 
-    /// Receive a blob into `sink`, verifying every byte against the sender's root; then acknowledge.
-    ///
-    /// A hash mismatch or short read is an error and the receiver signals rejection.
+    /// Read the head of a frame (its magic, header, length and root) and hand back the [`Incoming`] blob,
+    /// whose body is still on the stream and whose sender is still waiting for an answer.
     ///
     /// The magic is parsed as [`IDENTITY`] plus a [`WireVersion`], never compared as four bytes, so
     /// that "not our protocol" and "our protocol, another build" stay two facts instead of one. Both
     /// end the transfer here and neither is written back: this wire is write-then-read, so the peer
     /// is still streaming its body and is not listening. The distinction is for THIS side's log, and
     /// that is the whole of what it buys ([`Error::VersionMismatch`]).
-    pub(crate) async fn recv<Sink>(mut self, sink: &mut Sink) -> Result<Received>
-    where
-        Sink: io::AsyncWrite + Unpin,
-    {
+    pub(crate) async fn recv(mut self) -> Result<Incoming<W, R>> {
         let mut identity = [0u8; IDENTITY.len()];
         self.reader
             .read_exact(&mut identity)
@@ -254,47 +251,11 @@ where
             .read_exact(&mut root)
             .await
             .map_err(|_| Error::Truncated)?;
-
-        match self.verify_into(sink, len, &root).await {
-            Ok(()) => {
-                self.writer.write_all(&[ACK_OK]).await?;
-                self.writer.shutdown().await?;
-                Ok(Received {
-                    header,
-                    blob: Blob { root, len },
-                })
-            }
-            Err(err) => {
-                let _ = self.writer.write_all(&[ACK_ERR]).await;
-                let _ = self.writer.shutdown().await;
-                Err(err)
-            }
-        }
-    }
-
-    /// Stream exactly `len` bytes from the peer into `sink`, verifying them against `root`.
-    async fn verify_into<Sink>(&mut self, sink: &mut Sink, len: u64, root: &[u8; 32]) -> Result<()>
-    where
-        Sink: io::AsyncWrite + Unpin,
-    {
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; CHUNK];
-        let mut remaining = len;
-        while remaining > 0 {
-            let want = remaining.min(buf.len() as u64) as usize;
-            let read = self.reader.read(&mut buf[..want]).await?;
-            if read == 0 {
-                return Err(Error::Truncated);
-            }
-            hasher.update(&buf[..read]);
-            sink.write_all(&buf[..read]).await?;
-            remaining -= read as u64;
-        }
-        sink.flush().await?;
-        if hasher.finalize().as_bytes() != root {
-            return Err(Error::IntegrityFailed);
-        }
-        Ok(())
+        Ok(Incoming {
+            transfer: self,
+            header,
+            blob: Blob { root, len },
+        })
     }
 
     /// Read the one length-prefixed field the layout has, the app header, bounded by
@@ -329,6 +290,80 @@ where
             .await
             .map_err(|_| Error::Truncated)?;
         Ok(u64::from_be_bytes(bytes))
+    }
+}
+
+/// A blob whose frame head has been read and whose sender is waiting for one answer.
+///
+/// The answer is the receiver's last word on the whole push, so it is written by [`answer`](Self::answer)
+/// alone, from the outcome the caller hands it: a receiver that saves the blob somewhere answers only
+/// once the blob is saved, and a push it refuses at any step reads as a refusal at the sender. Dropping
+/// this without answering closes the stream, which the sender also reads as a failure.
+pub(crate) struct Incoming<W, R> {
+    transfer: Transfer<W, R>,
+    header: Vec<u8>,
+    blob: Blob,
+}
+
+impl<W, R> Incoming<W, R>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    /// The opaque, app-defined header the sender attached.
+    pub(crate) fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    /// The descriptor the sender declared. Its length is checked by [`verify_into`](Self::verify_into).
+    pub(crate) fn blob(&self) -> &Blob {
+        &self.blob
+    }
+
+    /// Stream exactly the declared length from the peer into `sink`, then check it against the root.
+    ///
+    /// The bytes reach `sink` before the root is checked, since the root covers the whole body, so a
+    /// caller that keeps the sink somewhere treats it as unchecked until this returns `Ok`.
+    pub(crate) async fn verify_into<Sink>(&mut self, sink: &mut Sink) -> Result<()>
+    where
+        Sink: io::AsyncWrite + Unpin,
+    {
+        let reader = &mut self.transfer.reader;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; CHUNK];
+        let mut remaining = self.blob.len;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let read = reader.read(&mut buf[..want]).await?;
+            if read == 0 {
+                return Err(Error::Truncated);
+            }
+            hasher.update(&buf[..read]);
+            sink.write_all(&buf[..read]).await?;
+            remaining -= read as u64;
+        }
+        sink.flush().await?;
+        if hasher.finalize().as_bytes() != &self.blob.root {
+            return Err(Error::IntegrityFailed);
+        }
+        Ok(())
+    }
+
+    /// Answer the sender from `outcome`, then hand `outcome` back: [`ACK_OK`] for `Ok`, [`ACK_ERR`] for
+    /// any `Err`, with nothing about why, so a refusal tells a pusher nothing about the receiver's disk.
+    ///
+    /// A failed write is not an error here. The outcome already happened: a blob that was saved stays
+    /// saved, and the sender, whose stream broke, reports a failure of its own.
+    pub(crate) async fn answer<T, E>(
+        mut self,
+        outcome: core::result::Result<T, E>,
+    ) -> core::result::Result<T, E> {
+        let ack = if outcome.is_ok() { ACK_OK } else { ACK_ERR };
+        let writer = &mut self.transfer.writer;
+        if writer.write_all(&[ack]).await.is_ok() {
+            let _ = writer.shutdown().await;
+        }
+        outcome
     }
 }
 

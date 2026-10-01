@@ -9,7 +9,7 @@ use super::{
     MAX_RENDERED_PATH, ReceiveError, Received, TempName, receive_file, render_path,
     reserve_then_rename, safe_relative_path,
 };
-use crate::wire::{Blob, Transfer};
+use crate::wire::{self, Blob, Transfer};
 
 #[test]
 fn a_traversal_header_is_reduced_to_a_safe_relative_path() {
@@ -43,7 +43,7 @@ fn an_empty_or_all_stripped_header_falls_back_to_download() {
 
 /// A landing failure reports the peer path SAFELY: the error the engine wraps into `ServeError` (and the
 /// tunnel logs at warn) carries the escaped/capped form, never the raw control bytes. The blob verifies
-/// and acks first; a directory at the destination then refuses the landing.
+/// first; a directory at the destination then refuses the landing.
 #[tokio::test]
 async fn a_landing_failure_reports_the_path_escaped() {
     let out = fresh_dir("landing-failure");
@@ -91,7 +91,7 @@ async fn a_push_lands_as_a_new_file() {
 }
 
 /// A push never replaces a file the receiver already holds: the name is refused as existing, the file
-/// keeps its bytes, and the verified temp is removed.
+/// keeps its bytes, the verified temp is removed, and the sender hears no.
 #[tokio::test]
 async fn a_push_never_replaces_a_file() {
     let out = fresh_dir("no-replace");
@@ -99,18 +99,74 @@ async fn a_push_never_replaces_a_file() {
     std::fs::create_dir_all(out.join(".config/app")).expect("the held directory is creatable");
     std::fs::write(&held, b"ORIGINAL").expect("the held file is writable");
 
-    let error = push(&out, b".config/app/settings", b"REPLACED")
-        .await
-        .expect_err("an existing name is refused");
+    let (received, sent) = exchange(&out, b".config/app/settings", b"REPLACED").await;
+    let error = received.expect_err("an existing name is refused");
 
     assert!(
         matches!(error, ReceiveError::Exists { .. }),
         "refused as existing: {error:?}"
     );
+    // The body verified before the landing was refused, so only the answer can tell the sender: a yes
+    // here would report as delivered a file that another push's bytes now hold the name of.
+    assert!(
+        matches!(sent, Err(wire::Error::Rejected)),
+        "the sender is told no: {sent:?}"
+    );
     assert_eq!(
         std::fs::read(&held).expect("the held file reads"),
         b"ORIGINAL",
         "the held file keeps its bytes"
+    );
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A retry of a push that already landed is a yes: the name holds exactly the bytes sent, so the sender
+/// whose answer was lost is not told no the way a squatted name tells it. The held file is untouched and
+/// no temp is left. `a_push_never_replaces_a_file` holds the other side: same length, other bytes, no.
+#[tokio::test]
+async fn a_retry_of_a_landed_push_is_answered_yes() {
+    let out = fresh_dir("retry");
+
+    push(&out, b"app.tar", b"RELEASE")
+        .await
+        .expect("the first push lands");
+    let (received, sent) = exchange(&out, b"app.tar", b"RELEASE").await;
+
+    let received = received.expect("the retry of the same bytes is accepted");
+    assert_eq!(received.path, Path::new("app.tar"));
+    assert!(sent.is_ok(), "the retrying sender is told yes: {sent:?}");
+    assert_eq!(
+        std::fs::read(out.join("app.tar")).expect("the landed file reads"),
+        b"RELEASE"
+    );
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A FIFO at the name is not a file holding the bytes: the check refuses it without opening it for a
+/// read that would wait for a writer, so the push is refused rather than stalled. The push is empty, so
+/// only the file-type check tells the FIFO's empty read from an empty file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fifo_at_the_name_is_refused_without_stalling() {
+    let out = fresh_dir("fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(out.join("pipe"))
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the fifo is creatable");
+
+    let error = tokio::time::timeout(Duration::from_secs(5), push(&out, b"pipe", b""))
+        .await
+        .expect("the push finishes")
+        .expect_err("a fifo at the name is refused");
+
+    assert!(
+        matches!(error, ReceiveError::Exists { .. }),
+        "refused as existing: {error:?}"
     );
     assert_no_temp_left(&out);
 
@@ -335,8 +391,25 @@ fn fresh_dir(name: &str) -> PathBuf {
 }
 
 /// Push `payload` under `header` through the real wire sender into the real `receive_file`, the way
-/// `Recv::serve` calls it once the gate admits a stream.
+/// `Recv::serve` calls it once the gate admits a stream, and hold the two ends to one verdict: a push the
+/// receiver saved is a success at the sender, and every push it refused is a failure there. So each
+/// refusal test below also proves the sender was told.
 async fn push(out: &Path, header: &[u8], payload: &[u8]) -> Result<Received, ReceiveError> {
+    let (received, sent) = exchange(out, header, payload).await;
+    assert_eq!(
+        received.is_ok(),
+        sent.is_ok(),
+        "the sender's verdict matches the receiver's: received {received:?}, sent {sent:?}"
+    );
+    received
+}
+
+/// One push, with what each end concluded: the receiver's result and the sender's.
+async fn exchange(
+    out: &Path,
+    header: &[u8],
+    payload: &[u8],
+) -> (Result<Received, ReceiveError>, Result<(), wire::Error>) {
     let (sender, receiver) = io::duplex(64 * 1024);
     let (sender_read, sender_write) = io::split(sender);
     let (receiver_read, receiver_write) = io::split(receiver);
@@ -353,11 +426,8 @@ async fn push(out: &Path, header: &[u8], payload: &[u8]) -> Result<Received, Rec
     });
 
     let received = receive_file(receiver_write, receiver_read, out, 0).await;
-    assert!(
-        sending.await.expect("the sender task completes").is_ok(),
-        "the blob verifies and acks before the landing is attempted"
-    );
-    received
+    let sent = sending.await.expect("the sender task completes");
+    (received, sent)
 }
 
 /// No temp file is left under `out` at its top level, where every temp is made.
