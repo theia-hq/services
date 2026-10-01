@@ -1,19 +1,26 @@
 //! The receive handler: take one admitted stream, receive one verified blob into
-//! a temp file, then move it into place under the output directory, named by a peer-supplied header reduced
-//! to a safe relative path.
+//! a fresh temp file, then land it under the output directory as a new file, named by a peer-supplied
+//! header reduced to a safe relative path.
+//!
+//! A landing never replaces a file, never leaves the output directory through a symlinked directory, and
+//! never targets the receiver's own temp files: a sender chooses the name, so every one of those would let
+//! a push rewrite something the receiver did not offer.
 
+use core::hash::BuildHasher as _;
+use std::ffi::OsStr;
+use std::hash::RandomState;
 use std::path::{Path, PathBuf};
 
 use bifrost::wire::Transfer;
 use tokio::io::{self, AsyncWriteExt as _};
 
-/// Receive one pushed file over an admitted stream: stream it into a temp file under `out`, verify it end
-/// to end (`bifrost-wire` checks every byte against the sender's BLAKE3 root), then move it into place at
-/// the safe relative path the sender named. On any failure the temp file is removed, so a rejected or
-/// truncated transfer never leaves a partial file behind.
+/// Receive one pushed file over an admitted stream: stream it into a fresh temp file under `out`, verify it
+/// end to end (`bifrost-wire` checks every byte against the sender's BLAKE3 root), then land it at the safe
+/// relative path the sender named. On any failure the temp file is removed, so a rejected or truncated
+/// transfer never leaves a partial file behind.
 ///
-/// `tag` distinguishes concurrent temp files on one node (the caller passes a per-stream value), so two
-/// files arriving at once never contend for the same temp path.
+/// `tag` is mixed into the temp file's random name; the temp is opened `create_new`, so two files arriving
+/// at once never share one, and nothing already on disk is ever opened as a temp.
 ///
 /// Crate-private: the entry is the [`Recv`](crate::Recv) handler, the only public door, and the `Never`
 /// ceiling it declares is the posture check.
@@ -27,15 +34,17 @@ where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    let temp = out.join(format!(".transfer-{}-{tag}.part", std::process::id()));
+    let temp = out.join(TempName::fresh(tag).0);
     let received = {
-        let mut file =
-            tokio::fs::File::create(&temp)
-                .await
-                .map_err(|source| ReceiveError::CreateTemp {
-                    path: render_path(&temp),
-                    source,
-                })?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await
+            .map_err(|source| ReceiveError::CreateTemp {
+                path: render_path(&temp),
+                source,
+            })?;
         match Transfer::new(writer, reader).recv(&mut file).await {
             Ok(received) => {
                 file.flush().await.map_err(|source| ReceiveError::Flush {
@@ -52,8 +61,35 @@ where
         }
     };
 
-    let relative = safe_relative_path(&received.header);
+    let landed = land(&temp, out, &received.header).await;
+    // The temp name goes either way: a landed file is already a second link to the same bytes, and a
+    // refused one must not linger as a partial or stray file under the output directory.
+    let _ = tokio::fs::remove_file(&temp).await;
+    Ok(Received {
+        path: landed?,
+        bytes: received.blob.len(),
+    })
+}
+
+/// Land the verified temp file at the path `header` names under `out`, as a new file, and return the safe
+/// relative path it landed at.
+///
+/// Every path in an error renders through `render_path`: the dispatcher logs the error text at warn, and
+/// the sender names the final path, so a raw newline or ESC may not ride the line.
+async fn land(temp: &Path, out: &Path, header: &[u8]) -> Result<PathBuf, ReceiveError> {
+    let relative = safe_relative_path(header);
     let final_path = out.join(&relative);
+    // A header naming the temp pattern could target another stream's in-flight temp file, or plant a name
+    // a later temp would collide with, so no component of a landing may look like one.
+    if relative
+        .components()
+        .any(|component| TempName::matches(component.as_os_str()))
+    {
+        return Err(ReceiveError::TempName {
+            path: render_path(&final_path),
+        });
+    }
+
     if let Some(parent) = final_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -61,20 +97,63 @@ where
                 path: render_path(parent),
                 source,
             })?;
+        // `safe_relative_path` strips `..` and roots, but a directory already inside `out` may be a
+        // symlink that leads out of it, and the kernel follows it. Comparing canonical forms is the check
+        // that holds whatever the path's spelling.
+        let root = canonical(out).await?;
+        let resolved = canonical(parent).await?;
+        if !resolved.starts_with(&root) {
+            return Err(ReceiveError::Escapes {
+                path: render_path(&final_path),
+            });
+        }
     }
-    // Every path in an error renders through `render_path`: the dispatcher logs the error text at warn,
-    // and the sender names the final path, so a raw newline or ESC may not ride the line.
-    tokio::fs::rename(&temp, &final_path)
-        .await
-        .map_err(|source| ReceiveError::Save {
+
+    // A hard link is the landing because it refuses an existing name, where a rename replaces it: a push
+    // may only add a file, never rewrite one the receiver already holds. A symlink at the final name is an
+    // existing name too, so it is refused rather than replaced or followed.
+    match tokio::fs::hard_link(temp, &final_path).await {
+        Ok(()) => Ok(relative),
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Err(ReceiveError::Exists {
+            path: render_path(&final_path),
+        }),
+        Err(source) => Err(ReceiveError::Save {
             path: render_path(&final_path),
             source,
-        })?;
+        }),
+    }
+}
 
-    Ok(Received {
-        path: relative,
-        bytes: received.blob.len(),
-    })
+/// Resolve `path` to its canonical form, every symlink followed, for the containment check.
+async fn canonical(path: &Path) -> Result<PathBuf, ReceiveError> {
+    tokio::fs::canonicalize(path)
+        .await
+        .map_err(|source| ReceiveError::Resolve {
+            path: render_path(path),
+            source,
+        })
+}
+
+/// The receiver's own temp file name: `.transfer-<random>.part`. The name is unguessable so a sender
+/// cannot aim at an in-flight temp, and the pattern is fixed so a landing that matches it can be refused.
+struct TempName(String);
+
+impl TempName {
+    const PREFIX: &str = ".transfer-";
+    const SUFFIX: &str = ".part";
+
+    /// A fresh name. `RandomState` keys SipHash from the OS's randomness and moves its keys on every call,
+    /// so hashing the tag yields a value a peer cannot predict, with no randomness dependency.
+    fn fresh(tag: u64) -> Self {
+        let random = RandomState::new().hash_one(tag);
+        Self(format!("{}{random:016x}{}", Self::PREFIX, Self::SUFFIX))
+    }
+
+    /// Whether `name` has the temp pattern's shape, whatever its middle.
+    fn matches(name: &OsStr) -> bool {
+        name.to_str()
+            .is_some_and(|name| name.starts_with(Self::PREFIX) && name.ends_with(Self::SUFFIX))
+    }
 }
 
 /// Why one pushed file was not saved. Each arm names the step that failed and the path it failed at,
@@ -112,7 +191,36 @@ pub enum ReceiveError {
         #[source]
         source: io::Error,
     },
-    /// The verified temp file could not be moved onto the destination the sender named.
+    /// The destination's parent directory could not be resolved to its canonical form.
+    #[error("resolve {path}: {source}")]
+    Resolve {
+        /// The directory, rendered for a log line.
+        path: String,
+        /// The filesystem failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The sender named a path whose directory resolves outside the output directory, through a symlinked
+    /// directory inside it. Nothing is written there.
+    #[error("{path} leads outside the output directory")]
+    Escapes {
+        /// The destination, rendered for a log line (the sender chose it).
+        path: String,
+    },
+    /// The sender named a path in the receiver's temp file pattern, which could target another stream's
+    /// in-flight file.
+    #[error("{path} has the name of a receive temp file")]
+    TempName {
+        /// The destination, rendered for a log line (the sender chose it).
+        path: String,
+    },
+    /// The sender named a path that already exists. A push only adds a file; it never replaces one.
+    #[error("{path} already exists")]
+    Exists {
+        /// The destination, rendered for a log line (the sender chose it).
+        path: String,
+    },
+    /// The verified temp file could not be linked at the destination the sender named.
     #[error("save to {path}: {source}")]
     Save {
         /// The destination, rendered for a log line (the sender chose it).
