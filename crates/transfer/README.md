@@ -30,8 +30,9 @@ it. A `ReceivedSink` must not block, because it runs before the stream finishes.
 
 To push, hash the source with `wire::Blob::hash`, rewind it, and call
 `wire::Transfer::new(writer, reader).send(name, &blob, &mut source)` on a stream the receiver admits. It
-returns once the receiver has landed the file; a refusal at any step is `wire::Error::Rejected`, and no
-answer within 10 minutes is `wire::Error::AckTimeout`.
+returns once the receiver has landed the file; a refusal once the receiver has read the frame's head is
+`wire::Error::Rejected`, and no answer within 10 minutes is `wire::Error::AckTimeout`, and the file may have
+landed.
 
 ## The limits
 
