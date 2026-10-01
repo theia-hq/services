@@ -424,6 +424,69 @@ async fn a_stream_that_runs_past_the_body_never_lands() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
+/// An empty file is pushed and lands whole: the sender proves its source empty before the frame, the
+/// receiver reads no body, and both ends agree.
+#[tokio::test]
+async fn an_empty_file_lands() {
+    let out = fresh_dir("empty");
+
+    let received = push(&out, b".gitkeep", b"")
+        .await
+        .expect("an empty file lands");
+
+    assert_eq!(received.bytes, 0);
+    assert_eq!(
+        std::fs::read(out.join(".gitkeep")).expect("the landed file reads"),
+        b""
+    );
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A body of several chunks and one byte more lands whole: the sender's held-back last chunk crosses a
+/// chunk boundary, and the receiver reads and checks it over many passes.
+#[tokio::test]
+async fn a_body_of_many_chunks_lands_whole() {
+    let out = fresh_dir("many-chunks");
+    let body: Vec<u8> = (0..3 * 64 * 1024 + 1).map(|at| (at % 251) as u8).collect();
+
+    let received = push(&out, b"big.bin", &body)
+        .await
+        .expect("a multi-chunk body lands");
+
+    assert_eq!(received.bytes, body.len() as u64);
+    assert_eq!(
+        std::fs::read(out.join("big.bin")).expect("the landed file reads"),
+        body
+    );
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A name refused from the frame's head is answered at once, while the body is still being written, so
+/// the sender's write breaks. It still reports the refusal, not the broken pipe: the body is larger than
+/// the stream's buffer, so the sender cannot have finished writing before the receiver stopped reading.
+#[tokio::test]
+async fn a_sender_mid_body_hears_a_refusal_from_the_head() {
+    let out = fresh_dir("refused-mid-body");
+    let body = vec![b'x'; 1024 * 1024];
+
+    let (received, sent) = exchange(&out, b".transfer-0123456789abcdef.part", &body).await;
+
+    assert!(
+        matches!(received, Err(ReceiveError::TempName { .. })),
+        "{received:?}"
+    );
+    assert!(
+        matches!(sent, Err(wire::Error::Rejected)),
+        "the sender hears the refusal: {sent:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 /// The landing for a filesystem with no exclusive rename, driven directly so it runs on every filesystem:
 /// it lands a new name and refuses an existing file and a symlink, keeping the temp for its caller.
 #[cfg(unix)]

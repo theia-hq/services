@@ -1,4 +1,7 @@
+use core::time::Duration;
+
 use tokio::io;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{ACK_DEADLINE, Blob, Error, MAX_HEADER_LEN, Transfer};
 
@@ -284,7 +287,7 @@ async fn a_receiver_answers_zero_to_a_body_that_does_not_match_its_root() {
 }
 
 /// The length of the golden frame's head: everything before the body.
-const GOLDEN_HEAD_LEN: usize = 4 + 4 + 8 + 8 + 32;
+const GOLDEN_HEAD_LEN: usize = 4 + 4 + GOLDEN_HEADER.len() + 8 + 32;
 
 /// A receiver that takes the whole frame and never answers cannot hold the sender: the wait for the
 /// answer has a deadline, and passing it is its own error. The outer bound only keeps the test finite
@@ -305,6 +308,48 @@ async fn a_sender_stops_waiting_for_an_answer_that_never_comes() {
     assert!(
         matches!(outcome, Ok(Err(Error::AckTimeout))),
         "the sender gives up on its own deadline: {outcome:?}"
+    );
+    let message = Error::AckTimeout.to_string();
+    assert!(
+        message.contains("may have arrived"),
+        "a timeout says the outcome is unknown: {message}"
+    );
+}
+
+/// The receiver answers only after the transport has delivered the whole body and the file has landed,
+/// and on a slow link that tail takes minutes after the sender shuts its half down. An answer five
+/// minutes late is still an answer: a shorter deadline reports a landed push as failed.
+#[tokio::test(start_paused = true)]
+async fn a_sender_waits_out_a_slow_answer() {
+    let blob = Blob::hash(&mut &*GOLDEN_BODY)
+        .await
+        .expect("the blob hashes");
+    let (sender, receiver) = io::duplex(64 * 1024);
+    let (sender_read, sender_write) = io::split(sender);
+    let (mut receiver_read, mut receiver_write) = io::split(receiver);
+
+    let answering = tokio::spawn(async move {
+        let mut frame = Vec::new();
+        receiver_read
+            .read_to_end(&mut frame)
+            .await
+            .expect("the frame arrives");
+        tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+        receiver_write
+            .write_all(&[1])
+            .await
+            .expect("the answer is written");
+        frame
+    });
+    let mut source = GOLDEN_BODY;
+    let sent = Transfer::new(sender_write, sender_read)
+        .send(GOLDEN_HEADER, &blob, &mut source)
+        .await;
+
+    assert!(sent.is_ok(), "a late yes is a yes: {sent:?}");
+    assert_eq!(
+        answering.await.expect("the receiver completes"),
+        golden_frame()
     );
 }
 

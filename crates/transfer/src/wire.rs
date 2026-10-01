@@ -110,11 +110,20 @@ const CHUNK: usize = 64 * 1024;
 
 /// How long a sender waits for the receiver's answer once its whole frame is sent.
 ///
-/// The receiver answers only after it is done with the blob (a receiver that saves it saves it first), and
-/// it may still be draining the body the transport buffered when the sender finished, so the wait is
-/// generous. It is bounded because a receiver that takes the body and never answers would otherwise hold
-/// the sender, and every stream it has open, forever.
-const ACK_DEADLINE: Duration = Duration::from_secs(60);
+/// The clock starts when the sender's half is shut down, and on a real transport that returns while the
+/// transport still holds bytes it has not delivered: a QUIC connection's default send window is 10 MB,
+/// shared by every stream on it, and a Noise session queues up to 64 frames of 16 KiB ahead of a
+/// stop-and-wait stream. The receiver answers only after the last of those bytes arrives and the file
+/// lands. Ten minutes drains 10 MB down to about 133 kbit/s; a shorter wait reports an honest slow push
+/// as failed after it landed, and its retry then finds the name taken. It is bounded at all only so that
+/// a receiver that takes the body and never answers cannot hold the sender, and every stream it has
+/// open, forever.
+const ACK_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// How long a sender whose write broke waits for an answer that may already be on the stream. A
+/// receiver that refuses from the frame's head answers at once and stops reading, so the answer is sent
+/// before the break and arrives with it; this only has to outlast that delivery.
+const BROKEN_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// A content-addressed blob descriptor: its BLAKE3 root and length. The root names the bytes, so
 /// anyone can verify what they received against it and the source cannot lie about content.
@@ -193,7 +202,11 @@ where
     /// `blob` must describe `source` (produce it with [`Blob::hash`]); the receiver checks every byte
     /// against `blob`'s root. Exactly `blob`'s length is sent: a source that ends early or runs past it
     /// is [`Error::LengthMismatch`], and the receiver never gets a whole blob from it. An answer that
-    /// does not come within a minute of the frame's end is [`Error::AckTimeout`].
+    /// does not come within ten minutes of the frame's end is [`Error::AckTimeout`], and the blob may
+    /// still have landed. A refusal the receiver makes while the body is still being written is
+    /// [`Error::Rejected`], like any other refusal.
+    ///
+    /// The deadline needs a runtime with the time driver enabled; without one, this panics.
     pub async fn send<Src>(mut self, header: &[u8], blob: &Blob, source: &mut Src) -> Result<()>
     where
         Src: io::AsyncRead + Unpin,
@@ -221,7 +234,9 @@ where
         // Finish the send half now: on QUIC this flushes every buffered byte and signals end of blob.
         // Waiting for the ack before finishing would deadlock (the receiver blocks on the last bytes
         // that finish is what delivers); the recv half stays open for the ack.
-        self.writer.shutdown().await?;
+        if let Err(broke) = self.writer.shutdown().await {
+            return Err(self.why_broken(broke).await);
+        }
 
         let mut ack = [0u8; 1];
         tokio::time::timeout(ACK_DEADLINE, self.reader.read_exact(&mut ack))
@@ -256,9 +271,22 @@ where
             if remaining == 0 {
                 source_ends(source).await?;
             }
-            self.writer.write_all(&buf[..read]).await?;
+            if let Err(broke) = self.writer.write_all(&buf[..read]).await {
+                return Err(self.why_broken(broke).await);
+            }
         }
         Ok(())
+    }
+
+    /// Why a write of the body broke. A receiver that refuses from the frame's head (a name it will not
+    /// save) answers and stops reading while the body is still coming, so the break can carry that
+    /// answer: read it, briefly, and report the refusal rather than the broken pipe.
+    async fn why_broken(&mut self, broke: io::Error) -> Error {
+        let mut ack = [0u8; 1];
+        match tokio::time::timeout(BROKEN_ANSWER_WAIT, self.reader.read_exact(&mut ack)).await {
+            Ok(Ok(_)) if ack[0] == ACK_ERR => Error::Rejected,
+            _ => Error::Io(broke),
+        }
     }
 
     /// Read the head of a frame (its magic, header, length and root) and hand back the [`Incoming`] blob,
@@ -476,8 +504,12 @@ pub enum Error {
     /// The peer rejected the transfer.
     #[error("peer rejected the transfer")]
     Rejected,
-    /// The peer did not answer within a minute of the frame's end.
-    #[error("the peer did not answer within {} seconds", ACK_DEADLINE.as_secs())]
+    /// The peer did not answer within ten minutes of the frame's end. The outcome is unknown: the blob
+    /// may have landed, and only the answer was lost or late.
+    #[error(
+        "the receiver did not answer within {} minutes; the file may have arrived",
+        ACK_DEADLINE.as_secs() / 60
+    )]
     AckTimeout,
 }
 
