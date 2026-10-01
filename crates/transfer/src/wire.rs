@@ -345,7 +345,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
     /// The stream did not open with this wire's identity, so it is not a stream of this wire. The wording
     /// is exactly true and covers only that: a peer of this wire on another version is never this.
-    #[error("not a file transfer stream")]
+    #[error("not a transfer stream")]
     Foreign,
     /// A stream of this wire from a build that speaks a different frame grammar.
     ///
@@ -361,7 +361,7 @@ pub enum Error {
     /// when the peer was a peer of this wire one release away, and sent them hunting a broken network
     /// instead of cutting a release.
     #[error(
-        "file transfer version mismatch: the frame is {peer}, this build speaks {VERSION}; run the \
+        "transfer wire version mismatch: the frame is {peer}, this build speaks {VERSION}; run the \
          same release at both ends"
     )]
     VersionMismatch {
