@@ -2,22 +2,26 @@
 //! a fresh temp file, then land it under the output directory as a new file, named by a peer-supplied
 //! header reduced to a safe relative path.
 //!
-//! A landing never replaces a file, never leaves the output directory through a symlinked directory, and
-//! never targets the receiver's own temp files: a sender chooses the name, so every one of those would let
-//! a push rewrite something the receiver did not offer.
+//! A landing never replaces a file, never passes through a symlink, and never targets the receiver's own
+//! temp files: a sender chooses the name, so every one of those would let a push rewrite something the
+//! receiver did not offer. Every step after opening the output directory works from a directory handle,
+//! never a path string, so nothing on disk can be swapped between a check and the use it guards.
 
 use core::hash::BuildHasher as _;
 use std::ffi::OsStr;
 use std::hash::RandomState;
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use bifrost::wire::Transfer;
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::io::Errno;
 use tokio::io::{self, AsyncWriteExt as _};
 
 /// Receive one pushed file over an admitted stream: stream it into a fresh temp file under `out`, verify it
 /// end to end (`bifrost-wire` checks every byte against the sender's BLAKE3 root), then land it at the safe
-/// relative path the sender named. On any failure the temp file is removed, so a rejected or truncated
-/// transfer never leaves a partial file behind.
+/// relative path the sender named. On any failure, and when the returned future is dropped mid-stream, the
+/// temp file is removed, so a rejected, truncated or abandoned transfer never leaves a partial file behind.
 ///
 /// `tag` is mixed into the temp file's random name; the temp is opened `create_new`, so two files arriving
 /// at once never share one, and nothing already on disk is ever opened as a temp.
@@ -34,132 +38,279 @@ where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    let temp = out.join(TempName::fresh(tag).0);
-    let received = {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await
-            .map_err(|source| ReceiveError::CreateTemp {
-                path: render_path(&temp),
-                source,
-            })?;
-        match Transfer::new(writer, reader).recv(&mut file).await {
-            Ok(received) => {
-                file.flush().await.map_err(|source| ReceiveError::Flush {
-                    path: render_path(&temp),
-                    source,
-                })?;
-                received
-            }
-            Err(err) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&temp).await;
-                return Err(ReceiveError::Transfer(err));
+    // Each filesystem step is a blocking syscall, so it runs on the blocking pool. Were this future dropped
+    // while one runs, the step still finishes and its `Temp` drops there, which removes the temp.
+    let opening = out.to_path_buf();
+    let (temp, file) = tokio::task::spawn_blocking(move || Temp::create(&opening, tag))
+        .await
+        .map_err(|joined| ReceiveError::CreateTemp {
+            path: render_path(out),
+            source: io::Error::other(joined),
+        })??;
+
+    let mut file = tokio::fs::File::from_std(file);
+    let received = Transfer::new(writer, reader).recv(&mut file).await?;
+    file.flush().await.map_err(|source| ReceiveError::Flush {
+        path: render_path(&out.join(temp.name.as_str())),
+        source,
+    })?;
+    // The temp is closed before it moves, so no handle outlives the name it was opened under.
+    drop(file);
+
+    let bytes = received.blob.len();
+    let landing = Landing::parse(&received.header, out)?;
+    let final_path = out.join(&landing.relative);
+    let path = tokio::task::spawn_blocking(move || temp.land(landing))
+        .await
+        .map_err(|joined| ReceiveError::Save {
+            path: render_path(&final_path),
+            source: io::Error::other(joined),
+        })??;
+    Ok(Received { path, bytes })
+}
+
+/// Where a sender asked a file to land: its header reduced to a safe relative path, with every refusal
+/// that depends only on the name already made. Parsing it first means a refused push creates nothing,
+/// not even a directory inside the output directory.
+struct Landing {
+    /// The safe relative path the file lands at under the output directory.
+    relative: PathBuf,
+    /// Where `relative` renders from, for an error's text.
+    out: PathBuf,
+}
+
+impl Landing {
+    /// Reduce `header` to a landing under `out`, refusing a name the receiver could never create.
+    fn parse(header: &[u8], out: &Path) -> Result<Self, ReceiveError> {
+        let landing = Self {
+            relative: safe_relative_path(header),
+            out: out.to_path_buf(),
+        };
+        // A header naming the temp pattern could target another stream's in-flight temp file, or plant a
+        // name a later temp would collide with, so no component of a landing may look like one.
+        if landing.relative.iter().any(TempName::matches) {
+            return Err(ReceiveError::TempName {
+                path: landing.render(),
+            });
+        }
+        // A NUL cannot reach a syscall, which takes C strings, so the name fails here, before a directory
+        // is made for it, with the error the syscall would have returned.
+        if landing.relative.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err(ReceiveError::Save {
+                path: landing.render(),
+                source: Errno::INVAL.into(),
+            });
+        }
+        Ok(landing)
+    }
+
+    /// The destination under the output directory, rendered for an error's text.
+    fn render(&self) -> String {
+        render_path(&self.out.join(&self.relative))
+    }
+
+    /// Open, or make, each directory the landing names under `out`, one handle at a time, and return the
+    /// handle its file lands in (`None` for `out` itself).
+    ///
+    /// Each directory is opened `O_NOFOLLOW` through its parent's handle, so a symlink is refused rather
+    /// than followed, whether it leads out of the output directory or not, and a directory swapped for a
+    /// symlink after an earlier step is refused the same way. The existing directories are all opened before
+    /// the first missing one is made, so a refusal on the way creates nothing.
+    fn walk(&self, out: BorrowedFd<'_>) -> Result<Option<OwnedFd>, ReceiveError> {
+        let mut directories = self.relative.parent().into_iter().flat_map(Path::iter);
+        let mut dir: Option<OwnedFd> = None;
+        let mut path = self.out.clone();
+        for directory in directories.by_ref() {
+            path.push(directory);
+            let parent = dir.as_ref().map_or(out, |dir| dir.as_fd());
+            match open_dir(parent, directory) {
+                Ok(next) => dir = Some(next),
+                Err(Errno::NOENT) => {
+                    dir = Some(make_dir(parent, directory, &path)?);
+                    break;
+                }
+                Err(Errno::LOOP | Errno::NOTDIR) if is_symlink(parent, directory) => {
+                    return Err(ReceiveError::Escapes {
+                        path: self.render(),
+                    });
+                }
+                Err(errno) => {
+                    return Err(ReceiveError::OpenDir {
+                        path: render_path(&path),
+                        source: errno.into(),
+                    });
+                }
             }
         }
-    };
+        // Below a directory this landing just made, nothing exists yet, so the rest are made without a look.
+        for directory in directories {
+            path.push(directory);
+            let parent = dir.as_ref().map_or(out, |dir| dir.as_fd());
+            dir = Some(make_dir(parent, directory, &path)?);
+        }
+        Ok(dir)
+    }
 
-    let landed = land(&temp, out, &received.header).await;
-    // The temp name goes either way: a landed file is already a second link to the same bytes, and a
-    // refused one must not linger as a partial or stray file under the output directory.
-    let _ = tokio::fs::remove_file(&temp).await;
-    Ok(Received {
-        path: landed?,
-        bytes: received.blob.len(),
+    /// The file name the landing ends in. `safe_relative_path` never returns an empty path, so there is
+    /// always one; were there not, the empty name would fail the landing as a save error.
+    fn name(&self) -> &OsStr {
+        self.relative.file_name().unwrap_or_default()
+    }
+}
+
+/// Open the directory `name` under `parent`, never following a symlink at `name`.
+fn open_dir(parent: BorrowedFd<'_>, name: &OsStr) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// Make the directory `name` under `parent` and open it. Another stream making the same directory first is
+/// not a failure: the open that follows refuses anything there but a real directory.
+fn make_dir(parent: BorrowedFd<'_>, name: &OsStr, path: &Path) -> Result<OwnedFd, ReceiveError> {
+    match rustix::fs::mkdirat(parent, name, DIR_MODE) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(errno) => {
+            return Err(ReceiveError::CreateDir {
+                path: render_path(path),
+                source: errno.into(),
+            });
+        }
+    }
+    open_dir(parent, name).map_err(|errno| ReceiveError::OpenDir {
+        path: render_path(path),
+        source: errno.into(),
     })
 }
 
-/// Land the verified temp file at the path `header` names under `out`, as a new file, and return the safe
-/// relative path it landed at.
-///
-/// Every path in an error renders through `render_path`: the dispatcher logs the error text at warn, and
-/// the sender names the final path, so a raw newline or ESC may not ride the line.
-async fn land(temp: &Path, out: &Path, header: &[u8]) -> Result<PathBuf, ReceiveError> {
-    let relative = safe_relative_path(header);
-    let final_path = out.join(&relative);
-    // A header naming the temp pattern could target another stream's in-flight temp file, or plant a name
-    // a later temp would collide with, so no component of a landing may look like one.
-    if relative
-        .components()
-        .any(|component| TempName::matches(component.as_os_str()))
-    {
-        return Err(ReceiveError::TempName {
-            path: render_path(&final_path),
-        });
-    }
-
-    let landing = contained_path(out, &relative, &final_path).await?;
-
-    // A hard link is the landing because it refuses an existing name, where a rename replaces it: a push
-    // may only add a file, never rewrite one the receiver already holds. A symlink at the final name is an
-    // existing name too, so it is refused rather than replaced or followed.
-    match tokio::fs::hard_link(temp, &landing).await {
-        Ok(()) => Ok(relative),
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Err(ReceiveError::Exists {
-            path: render_path(&final_path),
-        }),
-        Err(source) => Err(ReceiveError::Save {
-            path: render_path(&final_path),
-            source,
-        }),
-    }
+/// Whether `name` under `parent` is a symlink. `O_NOFOLLOW` refuses one with `ELOOP` on macOS and, with
+/// `O_DIRECTORY`, `ENOTDIR` on Linux, the same error a file in the way returns, so the refusal asks.
+fn is_symlink(parent: BorrowedFd<'_>, name: &OsStr) -> bool {
+    rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode).is_symlink())
 }
 
-/// Make the directories `relative` names under `out` and return where its file lands, never creating or
-/// resolving anything outside `out`.
-///
-/// `safe_relative_path` strips `..` and roots, but a directory already inside `out` may be a symlink that
-/// leads out of it, and the kernel follows it. So the walk goes one directory at a time: each is created
-/// if missing (never through a symlink, which `mkdir` treats as an existing name), then canonicalized and
-/// held under the canonical `out` before the next is made inside it. A symlink that leads out is refused
-/// before anything is created under it, and the file lands under the last canonical directory, so no later
-/// spelling of the path is followed again.
-async fn contained_path(
-    out: &Path,
-    relative: &Path,
-    final_path: &Path,
-) -> Result<PathBuf, ReceiveError> {
-    let root = canonical(out).await?;
-    let mut directories = relative.components();
-    // `safe_relative_path` never returns an empty path. Were it to, the landing would name `out` itself,
-    // which the link refuses as existing.
-    let Some(name) = directories.next_back() else {
-        return Ok(root);
-    };
-    let mut dir = root.clone();
-    for directory in directories {
-        let next = dir.join(directory);
-        match tokio::fs::create_dir(&next).await {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                return Err(ReceiveError::CreateDir {
-                    path: render_path(&next),
-                    source,
-                });
+/// A file's creation mode before the umask, as `std::fs::File::create` uses.
+const FILE_MODE: Mode = Mode::from_raw_mode(0o666);
+
+/// A directory's creation mode before the umask, as `std::fs::create_dir` uses.
+const DIR_MODE: Mode = Mode::from_raw_mode(0o777);
+
+/// The receive's temp file at the top of the output directory, held through the directory's handle.
+/// Dropping it removes the temp, so a stream that fails, a flush that fails, and a stream dropped at its
+/// caller's deadline all leave nothing behind; landing it disarms the removal.
+struct Temp {
+    /// The output directory, opened once: the temp is made, landed and removed relative to it.
+    out: OwnedFd,
+    /// The temp's name in `out`.
+    name: TempName,
+    /// Whether the temp is still on disk under `name`, so dropping it must remove it.
+    pending: bool,
+}
+
+impl Temp {
+    /// Open `out` and make a fresh temp in it, returning the guard and the file to write.
+    fn create(out: &Path, tag: u64) -> Result<(Self, std::fs::File), ReceiveError> {
+        let dir = rustix::fs::open(
+            out,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|errno| ReceiveError::OpenDir {
+            path: render_path(out),
+            source: errno.into(),
+        })?;
+        let name = TempName::fresh(tag);
+        let file = rustix::fs::openat(
+            &dir,
+            name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            FILE_MODE,
+        )
+        .map_err(|errno| ReceiveError::CreateTemp {
+            path: render_path(&out.join(name.as_str())),
+            source: errno.into(),
+        })?;
+        let temp = Self {
+            out: dir,
+            name,
+            pending: true,
+        };
+        Ok((temp, file.into()))
+    }
+
+    /// Move the verified temp to `landing` as a new file and return the safe relative path it landed at.
+    ///
+    /// Every path in an error renders through `render_path`: the dispatcher logs the error text at warn,
+    /// and the sender names the final path, so a raw newline or ESC may not ride the line.
+    fn land(mut self, landing: Landing) -> Result<PathBuf, ReceiveError> {
+        let dir = landing.walk(self.out.as_fd())?;
+        let to = dir.as_ref().map_or(self.out.as_fd(), |dir| dir.as_fd());
+        match place(self.out.as_fd(), self.name.as_str(), to, landing.name()) {
+            Ok(()) => {
+                self.pending = false;
+                Ok(landing.relative)
             }
+            Err(Errno::EXIST) => Err(ReceiveError::Exists {
+                path: landing.render(),
+            }),
+            Err(errno) => Err(ReceiveError::Save {
+                path: landing.render(),
+                source: errno.into(),
+            }),
         }
-        let resolved = canonical(&next).await?;
-        if !resolved.starts_with(&root) {
-            return Err(ReceiveError::Escapes {
-                path: render_path(final_path),
-            });
-        }
-        dir = resolved;
     }
-    Ok(dir.join(name))
 }
 
-/// Resolve `path` to its canonical form, every symlink followed, for the containment check.
-async fn canonical(path: &Path) -> Result<PathBuf, ReceiveError> {
-    tokio::fs::canonicalize(path)
-        .await
-        .map_err(|source| ReceiveError::Resolve {
-            path: render_path(path),
-            source,
-        })
+impl Drop for Temp {
+    fn drop(&mut self) {
+        if self.pending {
+            let _ = rustix::fs::unlinkat(&self.out, self.name.as_str(), AtFlags::empty());
+        }
+    }
+}
+
+/// Move `temp` under `from` to `name` under `to`, refusing an existing name with `EEXIST`: a push may only
+/// add a file, never rewrite one the receiver already holds. A symlink at `name` is an existing name too,
+/// so it is refused rather than replaced or followed.
+///
+/// Linux and macOS have an exclusive rename, one atomic step. A filesystem that refuses its flag (exFAT on
+/// macOS, and NFS by the Linux man page) gets [`reserve_then_rename`] instead.
+fn place(
+    from: BorrowedFd<'_>,
+    temp: &str,
+    to: BorrowedFd<'_>,
+    name: &OsStr,
+) -> rustix::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    match rustix::fs::renameat_with(from, temp, to, name, rustix::fs::RenameFlags::NOREPLACE) {
+        Err(Errno::NOTSUP | Errno::INVAL | Errno::NOSYS) => {}
+        placed => return placed,
+    }
+    reserve_then_rename(from, temp, to, name)
+}
+
+/// The landing where the filesystem has no exclusive rename: reserve `name` with an exclusive create, which
+/// refuses an existing file and a symlink, then rename the temp over the empty reservation this landing just
+/// made. If the rename fails, the reservation is removed.
+fn reserve_then_rename(
+    from: BorrowedFd<'_>,
+    temp: &str,
+    to: BorrowedFd<'_>,
+    name: &OsStr,
+) -> rustix::io::Result<()> {
+    drop(rustix::fs::openat(
+        to,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        FILE_MODE,
+    )?);
+    rustix::fs::renameat(from, temp, to, name).inspect_err(|_| {
+        let _ = rustix::fs::unlinkat(to, name, AtFlags::empty());
+    })
 }
 
 /// The receiver's own temp file name: `.transfer-<random>.part`. The name is unguessable so a sender
@@ -177,10 +328,18 @@ impl TempName {
         Self(format!("{}{random:016x}{}", Self::PREFIX, Self::SUFFIX))
     }
 
-    /// Whether `name` has the temp pattern's shape, whatever its middle.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `name` has the temp pattern's shape, whatever its middle and in any ASCII case: on a
+    /// case-insensitive filesystem an upper-case spelling names the same file.
     fn matches(name: &OsStr) -> bool {
-        name.to_str()
-            .is_some_and(|name| name.starts_with(Self::PREFIX) && name.ends_with(Self::SUFFIX))
+        let name = name.as_encoded_bytes();
+        let (prefix, suffix) = (Self::PREFIX.as_bytes(), Self::SUFFIX.as_bytes());
+        name.len() >= prefix.len() + suffix.len()
+            && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
     }
 }
 
@@ -210,7 +369,7 @@ pub enum ReceiveError {
         #[source]
         source: io::Error,
     },
-    /// The destination's parent directory could not be created.
+    /// A directory on the way to the destination could not be created.
     #[error("create the directory {path}: {source}")]
     CreateDir {
         /// The directory, rendered for a log line.
@@ -219,19 +378,18 @@ pub enum ReceiveError {
         #[source]
         source: io::Error,
     },
-    /// The output directory, or a directory on the way to the destination, could not be resolved to its
-    /// canonical form.
-    #[error("resolve {path}: {source}")]
-    Resolve {
+    /// The output directory, or a directory on the way to the destination, could not be opened.
+    #[error("open the directory {path}: {source}")]
+    OpenDir {
         /// The directory, rendered for a log line.
         path: String,
         /// The filesystem failure.
         #[source]
         source: io::Error,
     },
-    /// The sender named a path whose directory resolves outside the output directory, through a symlinked
-    /// directory inside it. Nothing is written there.
-    #[error("{path} leads outside the output directory")]
+    /// The sender named a path through a symlink inside the output directory. A symlink could lead out of
+    /// it, so none is followed, and nothing is written past it.
+    #[error("{path} passes through a symlink")]
     Escapes {
         /// The destination, rendered for a log line (the sender chose it).
         path: String,
@@ -249,7 +407,7 @@ pub enum ReceiveError {
         /// The destination, rendered for a log line (the sender chose it).
         path: String,
     },
-    /// The verified temp file could not be linked at the destination the sender named.
+    /// The verified temp file could not be moved to the destination the sender named.
     #[error("save to {path}: {source}")]
     Save {
         /// The destination, rendered for a log line (the sender chose it).

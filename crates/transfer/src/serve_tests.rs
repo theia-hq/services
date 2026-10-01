@@ -1,11 +1,14 @@
+use core::time::Duration;
+use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 
 use bifrost::wire::{Blob, Transfer};
+use rustix::io::Errno;
 use tokio::io;
 
 use super::{
     MAX_RENDERED_PATH, ReceiveError, Received, TempName, receive_file, render_path,
-    safe_relative_path,
+    reserve_then_rename, safe_relative_path,
 };
 
 #[test]
@@ -171,13 +174,133 @@ async fn a_push_creates_no_directory_outside_the_output_directory() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A symlinked directory is refused even when it leads back inside the output directory: following one
+/// at all is what lets a directory swapped for a symlink mid-push carry the file out.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_push_through_a_symlinked_dir_that_stays_inside_is_refused() {
+    let out = fresh_dir("symlink-in");
+    std::fs::create_dir_all(out.join("real")).expect("the inside directory is creatable");
+    std::os::unix::fs::symlink(out.join("real"), out.join("inlink"))
+        .expect("the symlink is creatable");
+
+    let error = push(&out, b"inlink/settings", b"VIA LINK")
+        .await
+        .expect_err("a symlinked directory is refused");
+
+    assert!(
+        matches!(error, ReceiveError::Escapes { .. }),
+        "refused as passing through a symlink: {error:?}"
+    );
+    assert!(
+        !out.join("real/settings").exists(),
+        "nothing lands through the symlink"
+    );
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A push refused for its name makes no directory for it: the refusal comes before the first one is made,
+/// so the new directories it named never appear, even inside the output directory.
+#[tokio::test]
+async fn a_refused_push_makes_no_directory() {
+    let out = fresh_dir("refused-no-dir");
+
+    let error = push(&out, b"new/deep/na\0me", b"NAMED")
+        .await
+        .expect_err("a NUL in the name is refused");
+
+    assert!(
+        matches!(error, ReceiveError::Save { .. }),
+        "refused as unsaveable: {error:?}"
+    );
+    assert!(!out.join("new").exists(), "no directory is made for it");
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A push dropped mid-stream, as a caller's deadline drops a silent stream, leaves no temp behind.
+#[tokio::test]
+async fn an_abandoned_push_leaves_no_temp() {
+    let out = fresh_dir("abandoned");
+    let (silent, receiver) = io::duplex(64 * 1024);
+    let (receiver_read, receiver_write) = io::split(receiver);
+
+    let receiving = {
+        let out = out.clone();
+        tokio::spawn(async move { receive_file(receiver_write, receiver_read, &out, 0).await })
+    };
+    assert!(
+        eventually(|| temps_in(&out) == 1).await,
+        "the receive makes its temp before the first byte"
+    );
+    receiving.abort();
+    let _ = receiving.await;
+    drop(silent);
+
+    assert!(
+        eventually(|| temps_in(&out) == 0).await,
+        "the dropped receive removes its temp"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// The landing for a filesystem with no exclusive rename, driven directly so it runs on every filesystem:
+/// it lands a new name and refuses an existing file and a symlink, keeping the temp for its caller.
+#[cfg(unix)]
+#[test]
+fn the_reservation_landing_never_replaces_a_file() {
+    let out = fresh_dir("reserve");
+    let dir = std::fs::File::open(&out).expect("the output directory opens");
+    let dir = dir.as_fd();
+    std::fs::write(out.join("temp"), b"PUSHED").expect("the temp is writable");
+    std::fs::write(out.join("held"), b"ORIGINAL").expect("the held file is writable");
+    std::os::unix::fs::symlink(out.join("held"), out.join("link"))
+        .expect("the symlink is creatable");
+
+    for existing in ["held", "link"] {
+        assert_eq!(
+            reserve_then_rename(dir, "temp", dir, existing.as_ref()),
+            Err(Errno::EXIST),
+            "{existing} is refused as existing"
+        );
+    }
+    assert_eq!(
+        std::fs::read(out.join("held")).expect("the held file reads"),
+        b"ORIGINAL"
+    );
+    assert!(
+        out.join("temp").exists(),
+        "a refusal leaves the temp to its caller"
+    );
+
+    reserve_then_rename(dir, "temp", dir, "new".as_ref()).expect("a new name lands");
+    assert_eq!(
+        std::fs::read(out.join("new")).expect("the landed file reads"),
+        b"PUSHED"
+    );
+    assert!(
+        !out.join("temp").exists(),
+        "the temp name is gone once landed"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 /// A sender cannot name the receiver's temp file pattern, at the top or nested, so it can never aim a
 /// landing at another stream's in-flight temp.
 #[tokio::test]
 async fn a_push_naming_a_temp_is_refused() {
     let out = fresh_dir("temp-name");
 
-    for header in [".transfer-0123456789abcdef.part", "dir/.transfer-x.part"] {
+    for header in [
+        ".transfer-0123456789abcdef.part",
+        "dir/.transfer-x.part",
+        ".TRANSFER-0123456789ABCDEF.PART",
+    ] {
         let error = push(&out, header.as_bytes(), b"PLANTED")
             .await
             .expect_err("a temp file name is refused");
@@ -199,6 +322,7 @@ fn temp_names_are_fresh_and_match_their_pattern() {
     let second = TempName::fresh(7).0;
     assert_ne!(first, second, "one tag still yields two names");
     assert!(TempName::matches(first.as_ref()));
+    assert!(TempName::matches(first.to_ascii_uppercase().as_ref()));
     assert!(!TempName::matches("settings".as_ref()));
 }
 
@@ -238,12 +362,28 @@ async fn push(out: &Path, header: &[u8], payload: &[u8]) -> Result<Received, Rec
 
 /// No temp file is left under `out` at its top level, where every temp is made.
 fn assert_no_temp_left(out: &Path) {
-    let left: Vec<_> = std::fs::read_dir(out)
+    assert_eq!(temps_in(out), 0, "no temp file is left");
+}
+
+/// How many temp files sit at `out`'s top level.
+fn temps_in(out: &Path) -> usize {
+    std::fs::read_dir(out)
         .expect("the output directory lists")
         .filter_map(Result::ok)
         .filter(|entry| TempName::matches(&entry.file_name()))
-        .collect();
-    assert!(left.is_empty(), "no temp file is left: {left:?}");
+        .count()
+}
+
+/// Whether `condition` holds within five seconds, checked every 10 ms: the receive's filesystem steps run
+/// on the blocking pool, so a test waits for their effect instead of racing it.
+async fn eventually(condition: impl Fn() -> bool) -> bool {
+    for _ in 0..500 {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
 }
 
 /// A peer-supplied filename cannot forge a log line or drive a terminal: the newline, escape byte,
