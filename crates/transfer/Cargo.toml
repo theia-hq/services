@@ -10,9 +10,9 @@ repository = "https://github.com/theia-hq/services"
 
 [dependencies]
 # siblings
-bifrost.workspace = true
 tightbeam-handler.workspace = true
 
+blake3 = "1"
 rustix.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros"] }

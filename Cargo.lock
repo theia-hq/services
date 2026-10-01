@@ -3144,7 +3144,7 @@ dependencies = [
 name = "transfer"
 version = "0.7.0"
 dependencies = [
- "bifrost",
+ "blake3",
  "rustix",
  "thiserror 2.0.20",
  "tightbeam-handler",

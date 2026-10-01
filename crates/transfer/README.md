@@ -3,7 +3,7 @@
 Receive one pushed file at a keyed node, over an admitted stream.
 
 `Recv` reads one blob off an already-admitted stream, verifies every byte against the sender's
-BLAKE3 root (`bifrost-wire`'s `Transfer`), and moves it into place under an output directory. On any
+BLAKE3 root (the `wire` module's `Transfer`), and moves it into place under an output directory. On any
 failure the temp file is removed, so a rejected or truncated transfer leaves no partial file behind.
 
 A sender-supplied name is reduced to a safe relative path first: roots, prefixes, and `..` are dropped, so

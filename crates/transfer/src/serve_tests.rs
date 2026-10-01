@@ -2,7 +2,6 @@ use core::time::Duration;
 use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 
-use bifrost::wire::{Blob, Transfer};
 use rustix::io::Errno;
 use tokio::io;
 
@@ -10,6 +9,7 @@ use super::{
     MAX_RENDERED_PATH, ReceiveError, Received, TempName, receive_file, render_path,
     reserve_then_rename, safe_relative_path,
 };
+use crate::wire::{Blob, Transfer};
 
 #[test]
 fn a_traversal_header_is_reduced_to_a_safe_relative_path() {

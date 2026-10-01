@@ -13,15 +13,17 @@ use std::hash::RandomState;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use bifrost::wire::Transfer;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use tokio::io::{self, AsyncWriteExt as _};
 
+use crate::wire::Transfer;
+
 /// Receive one pushed file over an admitted stream: stream it into a fresh temp file under `out`, verify it
-/// end to end (`bifrost-wire` checks every byte against the sender's BLAKE3 root), then land it at the safe
-/// relative path the sender named. On any failure, and when the returned future is dropped mid-stream, the
-/// temp file is removed, so a rejected, truncated or abandoned transfer never leaves a partial file behind.
+/// end to end (the [`wire`](crate::wire) checks every byte against the sender's BLAKE3 root), then land it
+/// at the safe relative path the sender named. On any failure, and when the returned future is dropped
+/// mid-stream, the temp file is removed, so a rejected, truncated or abandoned transfer never leaves a
+/// partial file behind.
 ///
 /// `tag` is mixed into the temp file's random name; the temp is opened `create_new`, so two files arriving
 /// at once never share one, and nothing already on disk is ever opened as a temp.
@@ -359,7 +361,7 @@ pub enum ReceiveError {
     },
     /// The wire transfer failed: a protocol fault, a truncated stream, or a blob that did not verify.
     #[error(transparent)]
-    Transfer(#[from] bifrost::wire::Error),
+    Transfer(#[from] crate::wire::Error),
     /// The verified bytes could not be flushed to the temp file.
     #[error("flush {path}: {source}")]
     Flush {
