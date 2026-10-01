@@ -146,6 +146,17 @@ impl Blob {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Whether `bytes`, `len` bytes long, are exactly this blob. The length is compared first, so a
+    /// short claim never makes the caller hash a large file; a reader that runs past `len` is cut there.
+    pub(crate) fn describes(&self, len: u64, bytes: impl std::io::Read) -> std::io::Result<bool> {
+        if len != self.len {
+            return Ok(false);
+        }
+        let mut hasher = blake3::Hasher::new();
+        let read = std::io::copy(&mut bytes.take(len), &mut hasher)?;
+        Ok(read == len && hasher.finalize().as_bytes() == &self.root)
+    }
 }
 
 /// A verified blob transfer over one bidirectional byte-stream pair.

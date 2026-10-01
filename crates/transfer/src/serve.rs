@@ -17,7 +17,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use tokio::io::{self, AsyncWriteExt as _};
 
-use crate::wire::{Incoming, Transfer};
+use crate::wire::{Blob, Incoming, Transfer};
 
 /// Receive one pushed file over an admitted stream: stream it into a fresh temp file under `out`, verify it
 /// end to end (the [`wire`](crate::wire) checks every byte against the sender's BLAKE3 root), land it at the
@@ -81,16 +81,19 @@ where
     // The temp is closed before it moves, so no handle outlives the name it was opened under.
     drop(file);
 
-    let bytes = incoming.blob().len();
+    let blob = *incoming.blob();
     let landing = Landing::parse(incoming.header(), out)?;
     let final_path = out.join(&landing.relative);
-    let path = tokio::task::spawn_blocking(move || temp.land(landing))
+    let path = tokio::task::spawn_blocking(move || temp.land(landing, &blob))
         .await
         .map_err(|joined| ReceiveError::Save {
             path: render_path(&final_path),
             source: io::Error::other(joined),
         })??;
-    Ok(Received { path, bytes })
+    Ok(Received {
+        path,
+        bytes: blob.len(),
+    })
 }
 
 /// Where a sender asked a file to land: its header reduced to a safe relative path, with every refusal
@@ -268,9 +271,14 @@ impl Temp {
 
     /// Move the verified temp to `landing` as a new file and return the safe relative path it landed at.
     ///
+    /// A name that already holds exactly `blob` counts as landed, and the temp is removed: a sender whose
+    /// file landed but whose answer was lost (a deadline, a dropped connection) retries, and a retry must
+    /// not read as the refusal a squatted name gets. The held file is never written. A pusher learns
+    /// from this only that a name holds bytes it already has.
+    ///
     /// Every path in an error renders through `render_path`: the dispatcher logs the error text at warn,
     /// and the sender names the final path, so a raw newline or ESC may not ride the line.
-    fn land(mut self, landing: Landing) -> Result<PathBuf, ReceiveError> {
+    fn land(mut self, landing: Landing, blob: &Blob) -> Result<PathBuf, ReceiveError> {
         let dir = landing.walk(self.out.as_fd())?;
         let to = dir.as_ref().map_or(self.out.as_fd(), |dir| dir.as_fd());
         match place(self.out.as_fd(), self.name.as_str(), to, landing.name()) {
@@ -278,6 +286,7 @@ impl Temp {
                 self.pending = false;
                 Ok(landing.relative)
             }
+            Err(Errno::EXIST) if holds(to, landing.name(), blob) => Ok(landing.relative),
             Err(Errno::EXIST) => Err(ReceiveError::Exists {
                 path: landing.render(),
             }),
@@ -295,6 +304,29 @@ impl Drop for Temp {
             let _ = rustix::fs::unlinkat(&self.out, self.name.as_str(), AtFlags::empty());
         }
     }
+}
+
+/// Whether `name` under `dir` is a regular file holding exactly `blob`. A symlink is not followed, and the
+/// open does not block, so a FIFO planted at the name cannot stall the check; anything but a regular file,
+/// and any failure to read it, is a no.
+fn holds(dir: BorrowedFd<'_>, name: &OsStr, blob: &Blob) -> bool {
+    let Ok(held) = rustix::fs::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(stat) = rustix::fs::fstat(&held) else {
+        return false;
+    };
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return false;
+    }
+    let len = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+    blob.describes(len, std::fs::File::from(held))
+        .unwrap_or(false)
 }
 
 /// Move `temp` under `from` to `name` under `to`, refusing an existing name with `EEXIST`: a push may only

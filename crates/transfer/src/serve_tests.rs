@@ -122,6 +122,57 @@ async fn a_push_never_replaces_a_file() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
+/// A retry of a push that already landed is a yes: the name holds exactly the bytes sent, so the sender
+/// whose answer was lost is not told no the way a squatted name tells it. The held file is untouched and
+/// no temp is left. `a_push_never_replaces_a_file` holds the other side: same length, other bytes, no.
+#[tokio::test]
+async fn a_retry_of_a_landed_push_is_answered_yes() {
+    let out = fresh_dir("retry");
+
+    push(&out, b"app.tar", b"RELEASE")
+        .await
+        .expect("the first push lands");
+    let (received, sent) = exchange(&out, b"app.tar", b"RELEASE").await;
+
+    let received = received.expect("the retry of the same bytes is accepted");
+    assert_eq!(received.path, Path::new("app.tar"));
+    assert!(sent.is_ok(), "the retrying sender is told yes: {sent:?}");
+    assert_eq!(
+        std::fs::read(out.join("app.tar")).expect("the landed file reads"),
+        b"RELEASE"
+    );
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A FIFO at the name is not a file holding the bytes: the check refuses it without opening it for a
+/// read that would wait for a writer, so the push is refused rather than stalled. The push is empty, so
+/// only the file-type check tells the FIFO's empty read from an empty file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fifo_at_the_name_is_refused_without_stalling() {
+    let out = fresh_dir("fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(out.join("pipe"))
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the fifo is creatable");
+
+    let error = tokio::time::timeout(Duration::from_secs(5), push(&out, b"pipe", b""))
+        .await
+        .expect("the push finishes")
+        .expect_err("a fifo at the name is refused");
+
+    assert!(
+        matches!(error, ReceiveError::Exists { .. }),
+        "refused as existing: {error:?}"
+    );
+    assert_no_temp_left(&out);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 /// A symlinked directory inside the output directory that leads out of it is never written through: the
 /// push is refused and nothing appears at the symlink's target.
 #[cfg(unix)]
