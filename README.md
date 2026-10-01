@@ -16,7 +16,7 @@ sees how the peer was reached or admitted; it gets a prepared proof and a stream
   same tests from the client side.
 - **[sshh](crates/sshh/README.md)**: serve a shell over an admitted stream to a standard `ssh` client, with no SSH keys; the
   stream's admission is the only credential.
-- **[transfer](crates/transfer/README.md)**: receive one pushed file off an admitted stream, verified end to end with BLAKE3 and saved
+- **[transfer](crates/transfer/README.md)**: push a file to a keyed node and receive it there, saved under an output directory and reported with the sender's key.
   under an output directory.
 
 This page describes the default branch.

@@ -3,6 +3,25 @@
 All notable changes to `transfer`, newest first. It carries its own version and its own cadence, so a
 release here moves `transfer` and nothing else in this repository.
 
+## Unreleased
+
+### Changed
+- **The transfer wire moved in, as `transfer::wire`.** A sender pushes with `wire::Transfer::send`, and
+  `transfer` no longer depends on bifrost. The bytes are unchanged: a frame still opens with `BFW1`.
+- **A push is answered only after the file lands.** A push the receiver refuses after reading the frame's
+  head now fails at the sender with `wire::Error::Rejected`. Before, a refusal at landing (a name an earlier file holds) reached the
+  sender as delivered.
+- **The sender waits at most 10 minutes for that answer**, then fails with `wire::Error::AckTimeout`; the file may still have
+  landed.
+- **Both ends hold to the declared length.** A source longer than its `Blob` is refused with
+  `Error::LengthMismatch`; a stream that runs past the body is refused with `Error::Overrun`.
+- **A refused name costs the receiver no disk.** The frame's head is read before the output directory is
+  opened or a temp file made.
+- **`Received` gains `from`, the sender's key as the gate admitted it.** That key says who sent the file.
+  The BLAKE3 root catches a file corrupted or changed while it was sent; it cannot catch a sender that
+  lies, because the sender supplies it.
+- The wire's errors no longer name bifrost: `not a transfer stream`, `transfer wire version mismatch: ...`.
+
 ## v0.7.0
 
 ### Changed

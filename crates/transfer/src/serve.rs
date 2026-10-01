@@ -13,16 +13,16 @@ use std::hash::RandomState;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+use nauthy::VerifyKey;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use tokio::io::{self, AsyncWriteExt as _};
 
 use crate::wire::{Blob, Incoming, Transfer};
 
-/// Receive one pushed file over an admitted stream: read the frame's head, stream the body into a fresh temp
-/// file under `out`, verify it end to end (the [`wire`](crate::wire) checks every byte against the sender's
-/// BLAKE3 root), land it at the safe relative path the sender named, and only then answer the sender. On
-/// any failure, and when the returned future is dropped mid-stream, the temp file is removed, so a
+/// Receive one pushed file over an admitted stream from `from`: read the frame's head, stream the body into
+/// a fresh temp file under `out`, check it against the root the sender sent, land it at the safe relative
+/// path the sender named, and only then answer the sender. On any failure, and when the returned future is dropped mid-stream, the temp file is removed, so a
 /// rejected, truncated or abandoned transfer never leaves a partial file behind.
 ///
 /// Nothing is spent on a stream before its head is read: the output directory is opened and the temp made
@@ -44,13 +44,14 @@ pub(crate) async fn receive_file<W, R>(
     reader: R,
     out: &Path,
     tag: u64,
+    from: VerifyKey,
 ) -> Result<Received, ReceiveError>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
     let mut incoming = Transfer::new(writer, reader).recv().await?;
-    let landed = land(&mut incoming, out, tag).await;
+    let landed = land(&mut incoming, out, tag, from).await;
     incoming.answer(landed).await
 }
 
@@ -60,6 +61,7 @@ async fn land<W, R>(
     incoming: &mut Incoming<W, R>,
     out: &Path,
     tag: u64,
+    from: VerifyKey,
 ) -> Result<Received, ReceiveError>
 where
     W: io::AsyncWrite + Unpin,
@@ -97,6 +99,7 @@ where
     Ok(Received {
         path,
         bytes: blob.len(),
+        from,
     })
 }
 
@@ -478,16 +481,19 @@ pub enum ReceiveError {
     },
 }
 
-/// One received file: the safe relative path it was saved at under the output directory, and its verified
-/// byte length. The fact a [`ReceivedSink`](crate::ReceivedSink) is handed, so the caller can report what
-/// landed. The path is raw and peer-named: safe to join under the output directory, never safe to print
-/// unescaped.
+/// One received file: the safe relative path it was saved at under the output directory, its byte length,
+/// and the key of the peer that sent it. The fact a [`ReceivedSink`](crate::ReceivedSink) is handed, so the
+/// caller can report what landed and who sent it. The path is raw and peer-named: safe to join under the
+/// output directory, never safe to print unescaped.
 #[derive(Debug, Clone)]
 pub struct Received {
     /// The path the file was saved at, relative to the output directory.
     pub path: PathBuf,
-    /// The verified length of the received bytes.
+    /// The length of the received bytes.
     pub bytes: u64,
+    /// The sender's key, as the gate admitted it: the transport proved the peer holds it. This, not the
+    /// root, is what says who the bytes came from, since a sender names the root of whatever it sends.
+    pub from: VerifyKey,
 }
 
 /// Reduce a peer-supplied header to a safe relative path under the output directory: keep only normal

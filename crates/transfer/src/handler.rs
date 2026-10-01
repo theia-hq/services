@@ -61,14 +61,17 @@ impl Handler for Recv {
 
     async fn serve(
         &self,
-        _served: Served<Self>,
+        served: Served<Self>,
         writer: BoxWrite,
         reader: BoxRead,
     ) -> Result<(), ServeError> {
         let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
         // The contract's stream-failure arm carries the typed cause as its source, so a consumer that
         // downcasts still sees the `ReceiveError`, and the rendered text is the arm's own message.
-        let received = crate::serve::receive_file(writer, reader, &self.out, tag)
+        // The key the gate admitted is the one fact about the file the sender cannot choose, so it travels
+        // with the file to whoever reports it.
+        let from = served.peer();
+        let received = crate::serve::receive_file(writer, reader, &self.out, tag, from)
             .await
             .map_err(|error| ServeError::Io(std::io::Error::other(error)))?;
         // The arrival is a value, never a line: rendering, escaping, and whether to show it at all belong
