@@ -2,6 +2,19 @@ use tokio::io;
 
 use super::{Blob, Error, MAX_HEADER_LEN, Transfer};
 
+/// Receive one frame the way a receiver that keeps nothing does: read its head, take its body into `sink`,
+/// and answer from the result. Returns the sender's header.
+async fn receive<W, R>(writer: W, reader: R, sink: &mut Vec<u8>) -> Result<Vec<u8>, Error>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let mut incoming = Transfer::new(writer, reader).recv().await?;
+    let verified = incoming.verify_into(sink).await;
+    let header = incoming.header().to_vec();
+    incoming.answer(verified.map(|()| header)).await
+}
+
 /// The four magic bytes a well-formed frame opens with, spelled out rather than imported, so a test
 /// cannot agree with the codec by sharing its constant.
 const MAGIC: [u8; 4] = *b"BFW1";
@@ -28,11 +41,13 @@ fn header_claim(header_len: u32) -> Vec<u8> {
 /// derive it from.
 #[tokio::test]
 async fn an_over_cap_header_length_is_refused_from_the_prefix_alone() {
-    let mut sink = Vec::new();
-    let error = Transfer::new(Vec::new(), header_claim(u32::MAX).as_slice())
-        .recv(&mut sink)
-        .await
-        .expect_err("a 4 GiB header claim is refused");
+    let error = receive(
+        Vec::new(),
+        header_claim(u32::MAX).as_slice(),
+        &mut Vec::new(),
+    )
+    .await
+    .expect_err("a 4 GiB header claim is refused");
 
     assert!(
         !matches!(error, Error::Truncated),
@@ -47,11 +62,13 @@ async fn an_over_cap_header_length_is_refused_from_the_prefix_alone() {
 /// The cap is a ceiling, not a neighbourhood: one byte over is refused.
 #[tokio::test]
 async fn a_header_one_byte_over_the_cap_is_refused() {
-    let mut sink = Vec::new();
-    let error = Transfer::new(Vec::new(), header_claim(MAX_HEADER_LEN + 1).as_slice())
-        .recv(&mut sink)
-        .await
-        .expect_err("one byte over the cap is refused");
+    let error = receive(
+        Vec::new(),
+        header_claim(MAX_HEADER_LEN + 1).as_slice(),
+        &mut Vec::new(),
+    )
+    .await
+    .expect_err("one byte over the cap is refused");
 
     assert!(
         matches!(error, Error::OversizedHeader { len } if len == MAX_HEADER_LEN + 1),
@@ -81,8 +98,7 @@ async fn a_header_at_the_cap_round_trips() {
     });
 
     let mut sink = Vec::new();
-    let received = Transfer::new(receiver_write, receiver_read)
-        .recv(&mut sink)
+    let received = receive(receiver_write, receiver_read, &mut sink)
         .await
         .expect("a header at the cap is accepted");
 
@@ -90,7 +106,7 @@ async fn a_header_at_the_cap_round_trips() {
         .await
         .expect("the sender task completes")
         .expect("the sender is acked");
-    assert_eq!(received.header, header);
+    assert_eq!(received, header);
     assert_eq!(sink, b"payload");
 }
 
@@ -126,10 +142,8 @@ fn magic_with(at: usize, byte: u8) -> Vec<u8> {
 /// version arm fire for a foreign identity too and the first assertion goes red.
 #[tokio::test]
 async fn a_foreign_identity_is_not_a_version_mismatch() {
-    let mut sink = Vec::new();
     // `XFW1`: one byte of the identity changed, and nothing else.
-    let error = Transfer::new(Vec::new(), magic_with(0, b'X').as_slice())
-        .recv(&mut sink)
+    let error = receive(Vec::new(), magic_with(0, b'X').as_slice(), &mut Vec::new())
         .await
         .expect_err("a foreign identity is not a stream of this wire");
 
@@ -149,10 +163,8 @@ async fn a_foreign_identity_is_not_a_version_mismatch() {
 /// both version tags: that string is the whole answer this wire gets to give.
 #[tokio::test]
 async fn a_version_mismatch_is_not_a_foreign_stream() {
-    let mut sink = Vec::new();
     // `BFW2`: one byte of the version changed, and nothing else.
-    let error = Transfer::new(Vec::new(), magic_with(3, b'2').as_slice())
-        .recv(&mut sink)
+    let error = receive(Vec::new(), magic_with(3, b'2').as_slice(), &mut Vec::new())
         .await
         .expect_err("BFW2 is not this build's grammar");
 
@@ -246,13 +258,11 @@ async fn a_sender_takes_zero_as_no() {
 async fn a_receiver_reads_the_golden_frame_and_answers_one() {
     let mut answer = Vec::new();
     let mut sink = Vec::new();
-    let received = Transfer::new(&mut answer, golden_frame().as_slice())
-        .recv(&mut sink)
+    let header = receive(&mut answer, golden_frame().as_slice(), &mut sink)
         .await
         .expect("the golden frame verifies");
 
-    assert_eq!(received.header, GOLDEN_HEADER);
-    assert_eq!(received.blob.len(), 7);
+    assert_eq!(header, GOLDEN_HEADER);
     assert_eq!(sink, GOLDEN_BODY);
     assert_eq!(answer, [1]);
 }
@@ -265,8 +275,7 @@ async fn a_receiver_answers_zero_to_a_body_that_does_not_match_its_root() {
     frame[last] ^= 1;
 
     let mut answer = Vec::new();
-    let error = Transfer::new(&mut answer, frame.as_slice())
-        .recv(&mut Vec::new())
+    let error = receive(&mut answer, frame.as_slice(), &mut Vec::new())
         .await
         .expect_err("a changed body is refused");
 

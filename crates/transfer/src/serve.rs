@@ -17,13 +17,18 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use tokio::io::{self, AsyncWriteExt as _};
 
-use crate::wire::Transfer;
+use crate::wire::{Incoming, Transfer};
 
 /// Receive one pushed file over an admitted stream: stream it into a fresh temp file under `out`, verify it
-/// end to end (the [`wire`](crate::wire) checks every byte against the sender's BLAKE3 root), then land it
-/// at the safe relative path the sender named. On any failure, and when the returned future is dropped
-/// mid-stream, the temp file is removed, so a rejected, truncated or abandoned transfer never leaves a
-/// partial file behind.
+/// end to end (the [`wire`](crate::wire) checks every byte against the sender's BLAKE3 root), land it at the
+/// safe relative path the sender named, and only then answer the sender. On any failure, and when the
+/// returned future is dropped mid-stream, the temp file is removed, so a rejected, truncated or abandoned
+/// transfer never leaves a partial file behind.
+///
+/// The answer comes last because it is the sender's only word on the push: a sender told yes before the
+/// landing would report a file as delivered that a refusal then threw away, while another push held its
+/// name. So every refusal after the frame's head, from a bad name to an existing file, reaches the sender
+/// as a refusal.
 ///
 /// `tag` is mixed into the temp file's random name; the temp is opened `create_new`, so two files arriving
 /// at once never share one, and nothing already on disk is ever opened as a temp.
@@ -50,8 +55,25 @@ where
             source: io::Error::other(joined),
         })??;
 
+    let mut incoming = Transfer::new(writer, reader).recv().await?;
+    let landed = land(&mut incoming, out, temp, file).await;
+    incoming.answer(landed).await
+}
+
+/// Take the incoming blob's body into `temp`, then land it under `out`: every step between reading the
+/// frame's head and answering the sender, so that the answer is made from one outcome.
+async fn land<W, R>(
+    incoming: &mut Incoming<W, R>,
+    out: &Path,
+    temp: Temp,
+    file: std::fs::File,
+) -> Result<Received, ReceiveError>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
     let mut file = tokio::fs::File::from_std(file);
-    let received = Transfer::new(writer, reader).recv(&mut file).await?;
+    incoming.verify_into(&mut file).await?;
     file.flush().await.map_err(|source| ReceiveError::Flush {
         path: render_path(&out.join(temp.name.as_str())),
         source,
@@ -59,8 +81,8 @@ where
     // The temp is closed before it moves, so no handle outlives the name it was opened under.
     drop(file);
 
-    let bytes = received.blob.len();
-    let landing = Landing::parse(&received.header, out)?;
+    let bytes = incoming.blob().len();
+    let landing = Landing::parse(incoming.header(), out)?;
     let final_path = out.join(&landing.relative);
     let path = tokio::task::spawn_blocking(move || temp.land(landing))
         .await
