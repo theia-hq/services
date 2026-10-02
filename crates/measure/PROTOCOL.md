@@ -147,8 +147,8 @@ every speed frame is 13.
 `seq` is the client's own probe index. `sent unix nanos` is an **opaque nonce**: the responder returns
 it untouched and `MUST NOT` read it as a clock, and the client `MUST` time the round trip with its own
 monotonic clock. Two machines' wall clocks are not comparable, so a stamp-derived round trip is not a
-measurement. Together the two fields are what lets a client reject a reply that belongs to an earlier
-probe.
+measurement. Together the two fields are what lets a client tell a reply to this probe from a late
+reply to an earlier one.
 
 ### `01` speed sink (the client uploads)
 
@@ -221,9 +221,11 @@ never by matching the two tables against each other.
 | 1 | seq | 4 | u32 big-endian, echoed from the request |
 | 5 | sent unix nanos | 8 | u64 big-endian, echoed from the request |
 
-Both fields `MUST` be returned verbatim. A client `MUST` reject a pong whose `seq` or nonce does not
-match the probe it is waiting on: a reply that arrives after its own probe was written off would
-otherwise be credited to the next probe as an impossibly fast round trip.
+Both fields `MUST` be returned verbatim. A client matches each pong to its probe by `seq`. A pong for an
+earlier probe arrived after that probe was counted lost: the client `MUST` skip it and keep waiting, and
+`MUST NOT` credit it to any probe, or a slow peer would read as an impossibly fast one. Any other pong
+whose `seq` or nonce does not match the probe it waits on answers nothing the client asked, and that
+probe is lost.
 
 ### `01` received
 
@@ -346,7 +348,8 @@ Three orderings in that table are normative rather than incidental:
 | ----- | ----- | ------ | ---- |
 | `Opened` | ping | write a ping frame | `AwaitingPong` |
 | `AwaitingPong` | `pong` whose seq and nonce match | record the round trip | `AwaitingPong` (next probe) |
-| `AwaitingPong` | `pong` that does not match | fail the run as mismatched | `Closed` |
+| `AwaitingPong` | `pong` for an earlier probe | skip it, keep waiting | `AwaitingPong` |
+| `AwaitingPong` | any other `pong` that does not match | count this probe lost, continue the run | `AwaitingPong` (next probe) |
 | `AwaitingPong` | `unsupported` | surface the typed refusal; **no report** | `Closed` |
 | `AwaitingPong` | nothing within the probe bound | count this probe lost, continue the run | `AwaitingPong` (next probe) |
 | `Opened` | sink | write the request, then send payload while reading | `Sending` |
@@ -392,7 +395,8 @@ not know, and what the receiver does with it:
 | refusal code | anything but `00`, `01`, `02` | client | fail the stream, reporting a refusal class this build cannot name; `MUST NOT` be mapped onto a known class, and `MUST NOT` fold into loss |
 | detail length | greater than 1024 | client | reject **before** allocating the buffer |
 | detail | not valid UTF-8 | client | reject; never repair lossily |
-| pong seq or nonce | not the ones this probe sent | client | fail as mismatched; `MUST NOT` credit the round trip |
+| pong seq | an earlier probe's | client | skip it and keep waiting; `MUST NOT` credit the round trip |
+| pong seq or nonce | any other value this probe did not send | client | count this probe lost; `MUST NOT` credit the round trip |
 | payload octets | any content | either | never inspected |
 
 The rule behind the two refusal rows is one rule: a value a build cannot name is never quietly promoted
