@@ -2948,7 +2948,7 @@ dependencies = [
 [[package]]
 name = "tightbeam-handler"
 version = "0.4.0"
-source = "git+https://github.com/theia-hq/tightbeam?rev=9abb4540cfdb6ac92b27a99ff50e7b242b169c76#9abb4540cfdb6ac92b27a99ff50e7b242b169c76"
+source = "git+https://github.com/theia-hq/tightbeam?rev=0a94560f4809d93575c0db8068e8dbcbe4fc33f3#0a94560f4809d93575c0db8068e8dbcbe4fc33f3"
 dependencies = [
  "bifrost-core",
  "nauthy",
