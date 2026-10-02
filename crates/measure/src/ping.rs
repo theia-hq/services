@@ -17,6 +17,7 @@ use core::time::Duration;
 use bifrost::Session;
 use futures::{Stream, StreamExt as _, stream};
 use tokio::io::{self, AsyncWriteExt as _};
+use tokio::task;
 use tokio::time::{self, Instant};
 
 use crate::protocol::{ProtocolError, Refusal, Request, Response};
@@ -147,6 +148,9 @@ impl Ping {
 /// The stream owns the read in flight, which is what lets a probe's bound abandon its wait without
 /// abandoning half a frame. It ends at the first frame that fails to decode: a failed read leaves the
 /// frame boundary unknown, so whatever follows could only be misframed, and every later probe is lost.
+///
+/// Fused, because every probe after the end polls it again: a bare `unfold` panics when polled past its
+/// end, and a peer decides when that end comes (a FIN, or one byte that is not a reply).
 fn replies<R>(reader: &mut R) -> impl Stream<Item = Result<Response, ProtocolError>> + '_
 where
     R: io::AsyncRead + Unpin,
@@ -158,6 +162,7 @@ where
             Err(error) => Some((Err(error), None)),
         }
     })
+    .fuse()
 }
 
 /// Send probe `seq` and wait for its echo, returning the locally-measured round-trip time.
@@ -190,7 +195,12 @@ where
         match reply? {
             Response::Pong {
                 seq: echoed_seq, ..
-            } if echoed_seq < seq => {}
+            } if echoed_seq < seq => {
+                // Hand the scheduler a turn before the next read. The bound is checked only when this
+                // wait returns pending, so a peer streaming stale pongs over a read that is always
+                // ready would otherwise hold the probe past its bound.
+                task::yield_now().await;
+            }
             Response::Pong {
                 seq: echoed_seq,
                 sent_unix_nanos: echoed_nonce,
