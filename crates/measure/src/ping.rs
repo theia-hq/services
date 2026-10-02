@@ -11,12 +11,13 @@
 //! and then went quiet, which is precisely the case a client must bound rather than wait on: the peer
 //! holds the client for as long as it stays silent, and silence is not something the stream reports.
 
+use core::pin::pin;
 use core::time::Duration;
-use std::time::Instant;
 
 use bifrost::Session;
-use tokio::io::AsyncWriteExt as _;
-use tokio::time;
+use futures::{Stream, StreamExt as _, stream};
+use tokio::io::{self, AsyncWriteExt as _};
+use tokio::time::{self, Instant};
 
 use crate::protocol::{ProtocolError, Refusal, Request, Response};
 
@@ -97,18 +98,22 @@ impl Ping {
         R: tokio::io::AsyncRead + Unpin,
     {
         let Self { count, interval } = self;
+        // One frame read for the whole run, never one per probe. A reply is decoded field by field,
+        // so a probe's bound that dropped the read mid-frame would leave the next read starting inside
+        // a frame and misframe every reply after it. The read in flight lives in this stream, so a
+        // bound drops only the wait for it and the next probe picks up the same read where it stopped.
+        let mut replies = pin!(replies(reader));
         let mut rtts = Vec::with_capacity(count as usize);
         for seq in 0..count {
             if seq > 0 {
                 time::sleep(interval).await;
             }
-            let rtt = match time::timeout(PROBE_TIMEOUT, probe(writer, reader, seq)).await {
+            let rtt = match time::timeout(PROBE_TIMEOUT, probe(writer, &mut replies, seq)).await {
                 // The peer took the probe and said nothing. It is the one failure a reliable stream
                 // cannot report, so the client bounds it itself, and it counts as the lost probe a
                 // person already means by loss. The run continues: the next probe is a fresh question,
-                // and a peer that wakes up answers it. A pong that arrives after its bound lands on
-                // that next probe's read, where the nonce check rejects it, so a late reply is never
-                // credited as a fast round trip.
+                // and a peer that wakes up answers it. Its pong, if it ever comes, reaches a later
+                // probe's wait, which skips it, so a late reply is never credited to any probe.
                 Err(_silent) => {
                     tracing::warn!(seq, bound = ?PROBE_TIMEOUT, "ping probe unanswered");
                     None
@@ -137,11 +142,34 @@ impl Ping {
     }
 }
 
-/// Send one probe and await its echo, returning the locally-measured round-trip time.
-async fn probe<W, R>(writer: &mut W, reader: &mut R, seq: u32) -> Result<Duration, ProtocolError>
+/// The replies on `reader`, one decoded frame per item, for the life of a run.
+///
+/// The stream owns the read in flight, which is what lets a probe's bound abandon its wait without
+/// abandoning half a frame. It ends at the first frame that fails to decode: a failed read leaves the
+/// frame boundary unknown, so whatever follows could only be misframed, and every later probe is lost.
+fn replies<R>(reader: &mut R) -> impl Stream<Item = Result<Response, ProtocolError>> + '_
 where
-    W: tokio::io::AsyncWrite + Unpin,
-    R: tokio::io::AsyncRead + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    stream::unfold(Some(reader), |reader| async move {
+        let reader = reader?;
+        match Response::read(reader).await {
+            Ok(frame) => Some((Ok(frame), Some(reader))),
+            Err(error) => Some((Err(error), None)),
+        }
+    })
+}
+
+/// Send probe `seq` and wait for its echo, returning the locally-measured round-trip time.
+///
+/// Replies are matched by sequence number, as `ping(8)` does. A pong for an earlier probe is a late
+/// reply to a probe already booked unanswered: it is skipped, never credited, and the wait for `seq`
+/// goes on inside its own bound. A pong for a later probe, or with a nonce this probe did not send,
+/// answers nothing this client asked, so it is [`ProtocolError::Mismatched`] and this probe is lost.
+async fn probe<W, S>(writer: &mut W, replies: &mut S, seq: u32) -> Result<Duration, ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+    S: Stream<Item = Result<Response, ProtocolError>> + Unpin,
 {
     // The nonce is opaque; a monotonic instant, not this stamp, is what times the round trip.
     let sent_unix_nanos = unix_nanos();
@@ -153,17 +181,29 @@ where
     .write(writer)
     .await?;
 
-    match Response::read(reader).await? {
-        Response::Pong {
-            seq: echoed_seq,
-            sent_unix_nanos: echoed_nonce,
-        } if echoed_seq == seq && echoed_nonce == sent_unix_nanos => Ok(started.elapsed()),
-        // The node admitted the stream but does not serve ping (a speed-only node): a REFUSAL, not a
-        // lost probe. It must short-circuit the whole run, never fold into loss.
-        Response::Unsupported { code, detail } => {
-            Err(ProtocolError::Refused(Refusal::Method { code, detail }))
+    loop {
+        // The stream ended because an earlier frame failed to decode; that failure was this run's
+        // loss already, and there is no boundary left to read a reply at.
+        let Some(reply) = replies.next().await else {
+            return Err(ProtocolError::Io(io::ErrorKind::UnexpectedEof.into()));
+        };
+        match reply? {
+            Response::Pong {
+                seq: echoed_seq, ..
+            } if echoed_seq < seq => {}
+            Response::Pong {
+                seq: echoed_seq,
+                sent_unix_nanos: echoed_nonce,
+            } if echoed_seq == seq && echoed_nonce == sent_unix_nanos => {
+                return Ok(started.elapsed());
+            }
+            // The node admitted the stream but does not serve ping (a speed-only node): a REFUSAL, not a
+            // lost probe. It must short-circuit the whole run, never fold into loss.
+            Response::Unsupported { code, detail } => {
+                return Err(ProtocolError::Refused(Refusal::Method { code, detail }));
+            }
+            _ => return Err(ProtocolError::Mismatched),
         }
-        _ => Err(ProtocolError::Mismatched),
     }
 }
 
@@ -221,16 +261,21 @@ impl PingReport {
         Some(total / self.received())
     }
 
-    /// The mean absolute deviation of round-trip time, as `ping(8)` reports it.
+    /// The standard deviation of round-trip time, the figure `ping(8)` prints as `mdev`.
+    ///
+    /// iputils computes it as sqrt(mean(x^2) - mean^2). This takes the mean of the squared deviations
+    /// instead, the same quantity, because it is a sum of squares and so never dips below zero from
+    /// rounding, where the difference of two near-equal means can, and the root of a negative is a NaN
+    /// that [`Duration::from_secs_f64`] panics on.
     pub fn mdev(&self) -> Option<Duration> {
         let avg = self.avg()?.as_secs_f64();
-        let mean_abs_dev = self
+        let variance = self
             .rtts
             .iter()
-            .map(|rtt| (rtt.as_secs_f64() - avg).abs())
+            .map(|rtt| (rtt.as_secs_f64() - avg).powi(2))
             .sum::<f64>()
             / self.received() as f64;
-        Some(Duration::from_secs_f64(mean_abs_dev))
+        Some(Duration::from_secs_f64(variance.sqrt()))
     }
 }
 

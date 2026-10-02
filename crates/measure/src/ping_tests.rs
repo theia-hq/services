@@ -12,11 +12,11 @@
 
 use core::time::Duration;
 
-use tokio::io::{self, DuplexStream};
+use tokio::io::{self, AsyncWriteExt as _, DuplexStream};
 use tokio::task::JoinHandle;
 use tokio::time;
 
-use super::{PROBE_TIMEOUT, Ping};
+use super::{PROBE_TIMEOUT, Ping, PingReport};
 use crate::protocol::{Request, Response};
 
 /// The bound each run is wrapped in, so a missing [`PROBE_TIMEOUT`] surfaces as a failed test rather
@@ -51,9 +51,9 @@ fn answering(server: DuplexStream, answered: &'static [u32]) -> JoinHandle<()> {
 }
 
 /// Serve probes, but only after `delay`: the peer whose pong arrives once the client has already
-/// counted that probe lost, so every reply lands on the read of the probe after it. `delay` must sit
-/// just PAST [`PROBE_TIMEOUT`] and well under twice it, or the next probe's own bound fires before the
-/// stale pong lands and the run never reaches the check that rejects it.
+/// counted that probe lost, so every reply lands during the wait of the probe after it. `delay` must
+/// sit just PAST [`PROBE_TIMEOUT`] and well under twice it, or the next probe's own bound fires before
+/// the stale pong lands and the run never reaches the reader that skips it.
 fn answering_after(server: DuplexStream, delay: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let (mut reader, mut writer) = io::split(server);
@@ -200,9 +200,9 @@ async fn a_peer_that_answers_some_probes_reports_exactly_those_it_did_not() {
     serving.abort();
 }
 
-/// A pong that arrives after its probe's bound lands on the next probe's read, where the nonce and
-/// sequence check rejects it. It must never be credited to the probe that was in flight when it
-/// landed: that would report a peer this slow as one with a sub-millisecond round trip.
+/// A pong that arrives after its probe's bound lands during the next probe's wait, where the reader
+/// skips it. It must never be credited to the probe that was in flight when it landed: that would
+/// report a peer this slow as one with a sub-millisecond round trip.
 #[tokio::test(start_paused = true)]
 async fn a_pong_that_arrives_after_its_bound_is_never_credited_to_the_next_probe() {
     let (client, server) = io::duplex(1024);
@@ -233,4 +233,199 @@ async fn a_pong_that_arrives_after_its_bound_is_never_credited_to_the_next_probe
     assert_eq!(report.loss(), 1.0);
 
     serving.abort();
+}
+
+/// Serve probes, answering probe 0 only after `first` and every later one after `rest`: a peer with one
+/// slow reply on an otherwise steady run. The pong for 0 still arrives, during a later probe's wait,
+/// which is the case the reader must skip without booking that later probe lost.
+fn answering_late_once(server: DuplexStream, first: Duration, rest: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let (mut reader, mut writer) = io::split(server);
+        while let Ok(Request::Ping {
+            seq,
+            sent_unix_nanos,
+        }) = Request::read(&mut reader).await
+        {
+            time::sleep(if seq == 0 { first } else { rest }).await;
+            let pong = Response::Pong {
+                seq,
+                sent_unix_nanos,
+            };
+            if pong.write(&mut writer).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// The defect: one late pong booked every later probe lost, because each probe read the reply meant
+/// for the one before it. Six probes, the first answered at 11 s and the rest at once, were answered
+/// five times, and the run must say five.
+#[tokio::test(start_paused = true)]
+async fn a_late_pong_leaves_every_later_probe_answered() {
+    let (client, server) = io::duplex(1024);
+    let (mut client_read, mut client_write) = io::split(client);
+    let serving = answering_late_once(server, Duration::from_secs(11), Duration::ZERO);
+
+    let mut seen = Vec::new();
+    let plan = Ping {
+        count: 6,
+        interval: Duration::from_secs(1),
+    };
+    let report = time::timeout(
+        HANG_BOUND,
+        plan.probes(&mut client_write, &mut client_read, |probe| {
+            seen.push((probe.seq, probe.rtt.is_some()))
+        }),
+    )
+    .await
+    .expect("one slow reply must not park the run")
+    .expect("a late reply is loss for its own probe, not a run-ending error");
+
+    assert_eq!(
+        seen,
+        vec![
+            (0, false),
+            (1, true),
+            (2, true),
+            (3, true),
+            (4, true),
+            (5, true)
+        ],
+        "only the probe whose reply came past its bound is unanswered"
+    );
+    assert_eq!(report.sent(), 6);
+    assert_eq!(report.received(), 5, "five of six probes were answered");
+
+    serving.abort();
+}
+
+/// The reader's second fault: a bound that drops a reply read between its fields leaves the next read
+/// starting inside that frame, so every later reply is misframed. Here probe 0's pong tag lands inside
+/// its bound and its fields after it; probe 1, answered at once, must still be read and matched.
+#[tokio::test(start_paused = true)]
+async fn a_bound_that_lands_mid_frame_leaves_the_next_probe_matched() {
+    let (client, server) = io::duplex(1024);
+    let (mut client_read, mut client_write) = io::split(client);
+    let serving = tokio::spawn(async move {
+        let (mut reader, mut writer) = io::split(server);
+        let Ok(Request::Ping {
+            seq,
+            sent_unix_nanos,
+        }) = Request::read(&mut reader).await
+        else {
+            return;
+        };
+        let mut torn = Vec::new();
+        Response::Pong {
+            seq,
+            sent_unix_nanos,
+        }
+        .write(&mut torn)
+        .await
+        .expect("a pong encodes into memory");
+        let (tag, fields) = torn.split_at(1);
+
+        time::sleep(PROBE_TIMEOUT / 2).await;
+        writer.write_all(tag).await.expect("the client is reading");
+        writer.flush().await.expect("the client is reading");
+        time::sleep(PROBE_TIMEOUT).await;
+        writer
+            .write_all(fields)
+            .await
+            .expect("the client is reading");
+
+        while let Ok(Request::Ping {
+            seq,
+            sent_unix_nanos,
+        }) = Request::read(&mut reader).await
+        {
+            let pong = Response::Pong {
+                seq,
+                sent_unix_nanos,
+            };
+            if pong.write(&mut writer).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = Vec::new();
+    let plan = Ping {
+        count: 2,
+        interval: Duration::ZERO,
+    };
+    let report = time::timeout(
+        HANG_BOUND,
+        plan.probes(&mut client_write, &mut client_read, |probe| {
+            seen.push((probe.seq, probe.rtt.is_some()))
+        }),
+    )
+    .await
+    .expect("a torn reply must not park the run")
+    .expect("a reply torn across a bound is loss, not a run-ending error");
+
+    assert_eq!(
+        seen,
+        vec![(0, false), (1, true)],
+        "the reply after a torn one is read whole and matched"
+    );
+    assert_eq!(report.received(), 1);
+
+    serving.abort();
+}
+
+/// A late pong that the reader skips adds no sample. Probe 0 is answered at 11 s, past its bound, and
+/// probe 1 three seconds after it was sent; the one round trip in the report is probe 1's 3 s. Had the
+/// late pong been credited as it arrived, the run would hold a 1 s sample (probe 1 sent at 10 s, pong
+/// 0 in at 11 s) or an 11 s one.
+#[tokio::test(start_paused = true)]
+async fn a_skipped_late_pong_is_never_an_rtt() {
+    let (client, server) = io::duplex(1024);
+    let (mut client_read, mut client_write) = io::split(client);
+    let serving = answering_late_once(server, Duration::from_secs(11), Duration::from_secs(2));
+
+    let plan = Ping {
+        count: 2,
+        interval: Duration::ZERO,
+    };
+    let report = time::timeout(
+        HANG_BOUND,
+        plan.probes(&mut client_write, &mut client_read, |_probe| {}),
+    )
+    .await
+    .expect("one slow reply must not park the run")
+    .expect("a late reply is loss for its own probe, not a run-ending error");
+
+    let probe_one = Duration::from_secs(3);
+    assert_eq!(report.received(), 1, "only probe 1 was answered in time");
+    assert_eq!(
+        (report.min(), report.max()),
+        (Some(probe_one), Some(probe_one)),
+        "the only sample is probe 1's own round trip: {report:?}"
+    );
+
+    serving.abort();
+}
+
+/// `mdev` is the standard deviation `ping(8)` prints under that label, not the mean absolute
+/// deviation. One slow sample among three steady ones is where the two part: 17.3 ms against 15.0.
+#[test]
+fn mdev_is_the_standard_deviation() {
+    let report = PingReport {
+        sent: 4,
+        rtts: [13.0, 13.0, 13.1, 53.1]
+            .map(|ms| Duration::from_secs_f64(ms / 1000.0))
+            .to_vec(),
+    };
+
+    let mdev_ms = report
+        .mdev()
+        .expect("four samples have a deviation")
+        .as_secs_f64()
+        * 1000.0;
+    assert!(
+        (mdev_ms - 17.3).abs() < 0.05,
+        "ping(8) prints 17.3 ms for these samples, this printed {mdev_ms}"
+    );
 }
