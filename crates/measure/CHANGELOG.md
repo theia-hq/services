@@ -3,6 +3,21 @@
 All notable changes to `measure`, newest first. It carries its own version and its own cadence, so a
 release here moves `measure` and nothing else in this repository.
 
+## Unreleased
+
+### Fixed
+- **One late reply no longer costs every later probe.** `Ping` matches each pong to its probe by
+  sequence number and skips a pong that arrives after its probe was counted lost. Before, six probes
+  with the first answered at 11 s reported none received; they now report five.
+- **A probe that times out partway through a reply no longer misreads every reply after it.**
+- **`PingReport::mdev` is the standard deviation**, the figure `ping(8)` prints as `mdev`. It was the
+  mean absolute deviation, which reads lower when one sample is slow: 13.0, 13.0, 13.1 and 53.1 ms give
+  17.3 ms, not 15.0 ms.
+
+### Docs
+- **`PROTOCOL.md`** states the client's pong rule: a pong for an earlier probe is skipped, and any other
+  pong that does not match loses only the probe waiting on it.
+
 ## v0.7.0
 
 ### Changed

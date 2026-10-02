@@ -262,13 +262,12 @@ impl PingReport {
     }
 
     /// The standard deviation of round-trip time, the figure `ping(8)` prints as `mdev`.
-    ///
-    /// iputils computes it as sqrt(mean(x^2) - mean^2). This takes the mean of the squared deviations
-    /// instead, the same quantity, because it is a sum of squares and so never dips below zero from
-    /// rounding, where the difference of two near-equal means can, and the root of a negative is a NaN
-    /// that [`Duration::from_secs_f64`] panics on.
     pub fn mdev(&self) -> Option<Duration> {
         let avg = self.avg()?.as_secs_f64();
+        // iputils computes this as sqrt(mean(x^2) - mean^2). The mean of the squared deviations is
+        // the same quantity, and as a sum of squares it never dips below zero from rounding, where
+        // the difference of two near-equal means can, and the root of a negative is a NaN that
+        // `Duration::from_secs_f64` panics on.
         let variance = self
             .rtts
             .iter()

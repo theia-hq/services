@@ -2,7 +2,7 @@
 
 Ping and speed diagnostics for a session to a peer.
 
-`Ping` sends a count of probes at an interval and reports min, average, max, mean deviation, and loss.
+`Ping` sends a count of probes at an interval and reports min, average, max, standard deviation, and loss.
 `Speedtest` moves counted bytes in one direction or both at once, bounded by a byte count or a wall-clock
 window, and reports MiB/s per direction. Both clients are generic over `bifrost::Session`, so the same run
 works over iroh, an in-process transport, or any future transport.
