@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http::{FetchRequest, FetchResponse};
-use crate::origin::OriginAllowlist;
+use crate::origin::{OriginAllowlist, OriginError};
 use crate::serve::{
     FETCH_MAX_BYTES, FETCH_TIMEOUT_MESSAGE, FETCH_TOTAL_TIMEOUT, FetchError, Limits,
     allowed_method, bounded, forward_headers, is_public, serve_fetch, stream_response,
@@ -276,6 +276,153 @@ async fn a_version_skewed_requester_is_answered_not_dropped() {
     assert!(
         output.is_empty(),
         "the write half closes after the answer; no origin was reached"
+    );
+}
+
+/// One of every refusal cause, each rendered the way the engine renders it into an error frame. The
+/// `match` has no wildcard arm, so a new cause stops this file compiling until it joins the list.
+fn every_refusal() -> Vec<FetchError> {
+    let builder_error = || {
+        reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("a relative url is a builder error")
+    };
+    let refusals = vec![
+        FetchError::Method("POST".to_owned()),
+        FetchError::Url(url::ParseError::EmptyHost),
+        FetchError::OriginNotAllowed("https://elsewhere.example".to_owned()),
+        FetchError::Scheme("ftp".to_owned()),
+        FetchError::Origin(OriginError::Url(url::ParseError::RelativeUrlWithoutBase)),
+        FetchError::Origin(OriginError::Userinfo),
+        FetchError::Origin(OriginError::NoHost),
+        FetchError::Origin(OriginError::NoPort),
+        FetchError::Resolve {
+            host: "origin.example".to_owned(),
+            source: std::io::Error::other("lookup failed"),
+        },
+        FetchError::NoAddresses("origin.example".to_owned()),
+        FetchError::NonPublic {
+            host: "metadata.example".to_owned(),
+        },
+        FetchError::Client(builder_error()),
+        FetchError::Request(builder_error()),
+        FetchError::TimedOut,
+    ];
+    for refusal in &refusals {
+        match refusal {
+            FetchError::Method(_)
+            | FetchError::Url(_)
+            | FetchError::OriginNotAllowed(_)
+            | FetchError::Scheme(_)
+            | FetchError::Origin(_)
+            | FetchError::Resolve { .. }
+            | FetchError::NoAddresses(_)
+            | FetchError::NonPublic { .. }
+            | FetchError::Client(_)
+            | FetchError::Request(_)
+            | FetchError::TimedOut => {}
+        }
+    }
+    refusals
+}
+
+/// Every error text a requester can be shown: the refusals the host writes into an error frame, the
+/// version answer, and the errors the requester's own frame reader raises on a stream it cannot read.
+async fn every_requester_facing_text() -> Vec<String> {
+    let mut texts: Vec<String> = every_refusal().iter().map(ToString::to_string).collect();
+
+    let mut skewed = Vec::new();
+    FetchRequest {
+        method: "GET".to_owned(),
+        url: "https://example.com/".to_owned(),
+        headers: Vec::new(),
+    }
+    .write(&mut skewed)
+    .await
+    .expect("encode");
+    skewed[3] = b'2';
+    let unreadable = FetchRequest::read(&mut skewed.as_slice())
+        .await
+        .expect_err("TBH2 is not this build's grammar");
+    let Some(FetchResponse::Error(answer)) = unreadable.answer() else {
+        panic!("a version mismatch is answered: {unreadable}");
+    };
+    texts.push(answer);
+    skewed[0] = b'X';
+    let foreign = FetchRequest::read(&mut skewed.as_slice())
+        .await
+        .expect_err("XBH2 is not this protocol");
+    texts.push(foreign.to_string());
+
+    // The requester's reader: a foreign response tag, an unknown frame tag, and an over-cap header count.
+    let unreadable_responses: [&[u8]; 3] = [b"SSH-2.0", b"TBH1\x07", b"TBH1\x00\x00\xc8\xff\xff"];
+    for mut bytes in unreadable_responses {
+        let error = FetchResponse::read(&mut bytes)
+            .await
+            .expect_err("an unreadable response frame is an error");
+        texts.push(error.to_string());
+    }
+    texts
+}
+
+/// No error text a requester can be shown names this engine. A requester may echo the text to a person
+/// who never chose an engine (a downloader reading an HTTP error body), so the text describes the act and
+/// nothing behind it. Restore an old rendering such as "origin fetch timed out" and this goes red.
+#[tokio::test]
+async fn no_requester_facing_error_names_the_engine() {
+    for text in every_requester_facing_text().await {
+        assert!(
+            !text.to_ascii_lowercase().contains("fetch"),
+            "names the engine: {text}"
+        );
+    }
+}
+
+/// Whether `text` holds anything that reads as an IP address, v4 or v6.
+fn names_an_address(text: &str) -> bool {
+    text.split(|char: char| !(char.is_ascii_hexdigit() || char == '.' || char == ':'))
+        .map(|token| token.trim_end_matches(['.', ':']))
+        .any(|token| token.parse::<IpAddr>().is_ok())
+}
+
+/// The SSRF refusal names the host the requester sent and never the address it resolved to: that address
+/// is the host's internal DNS, and echoing it would map a private network one name per request.
+/// `localhost` resolves to loopback on every host, so this is the real refusal path end to end. Put the
+/// resolved address back into the rendering and this goes red at the last assertion.
+#[tokio::test]
+async fn a_private_refusal_names_no_address() {
+    let request = FetchRequest {
+        method: "GET".to_owned(),
+        url: "http://localhost/".to_owned(),
+        headers: Vec::new(),
+    };
+    let mut encoded = Vec::new();
+    request.write(&mut encoded).await.expect("encode");
+    let mut reader: &[u8] = &encoded;
+    let mut writer = Vec::new();
+    serve_fetch(
+        &mut writer,
+        &mut reader,
+        &OriginAllowlist::default(),
+        Limits::metered(),
+    )
+    .await
+    .expect("a refused fetch is a served error response");
+
+    let frame = FetchResponse::read(&mut writer.as_slice())
+        .await
+        .expect("frame");
+    let FetchResponse::Error(message) = frame else {
+        panic!("loopback is refused, never served: {frame:?}");
+    };
+    assert!(
+        message.contains("localhost") && message.contains("non-public"),
+        "this is the private-address refusal: {message}"
+    );
+    assert!(
+        !names_an_address(&message),
+        "the refusal leaks a resolved address: {message}"
     );
 }
 

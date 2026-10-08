@@ -153,7 +153,6 @@ async fn the_encoder_writes_a_header_list_its_own_decoder_refuses() {
 /// cargo test -p fetch --lib http_tests::vectors -- --nocapture
 /// ```
 mod vectors {
-    use core::net::{IpAddr, Ipv4Addr};
     use std::collections::BTreeMap;
 
     use crate::http::{FetchRequest, FetchResponse};
@@ -281,7 +280,6 @@ mod vectors {
                 "tbh1-response-error-non-public",
                 FetchError::NonPublic {
                     host: "metadata.example".to_owned(),
-                    ip: IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
                 },
             )
             .await,

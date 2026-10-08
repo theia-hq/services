@@ -30,22 +30,27 @@ pub(crate) const FETCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The text a metered fetch puts on the wire when the origin misses [`FETCH_TOTAL_TIMEOUT`] before any
-/// header: the rendering of [`FetchError::TimedOut`].
-pub(crate) const FETCH_TIMEOUT_MESSAGE: &str = "origin fetch timed out";
+/// header: the rendering of [`FetchError::TimedOut`]. Like every refusal it names the act, never this
+/// engine, since a requester may show it to someone who has never heard of it.
+pub(crate) const FETCH_TIMEOUT_MESSAGE: &str = "origin timed out";
 
 /// Why one origin fetch was refused, before or at the origin. Every refusal the responder can produce is
 /// one arm here, so the engine matches a cause rather than assembling a message at the site; the requester
 /// reads the rendering as the [`FetchResponse::Error`] text, since a cause cannot cross the wire as a type.
+///
+/// Because every rendering here goes on the wire, each one describes the act in neutral words: it names
+/// no engine (a requester may echo it to a person who never chose one), and it carries the requester's
+/// own input at most, never a fact about this host's network.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FetchError {
     /// The request named a method other than GET or HEAD.
-    #[error("method {0} not allowed (fetch is GET/HEAD only)")]
+    #[error("method {0} not allowed: only GET and HEAD are allowed")]
     Method(String),
     /// The request URL does not parse.
     #[error("invalid url: {0}")]
     Url(#[from] url::ParseError),
     /// The request URL's origin is outside this service's allowlist.
-    #[error("origin {0} not allowed by this fetch service")]
+    #[error("origin {0} is not allowed")]
     OriginNotAllowed(String),
     /// The request URL's scheme is not `http` or `https`.
     #[error("scheme {0} not allowed (http/https only)")]
@@ -66,12 +71,14 @@ pub(crate) enum FetchError {
     #[error("{0} resolved to no addresses")]
     NoAddresses(String),
     /// The host resolves to at least one non-public address, the SSRF shape this service refuses whole.
-    #[error("refusing to fetch {host}: it resolves to the non-public address {ip}")]
+    ///
+    /// Carries the host and NOT the address it resolved to: that address is this host's internal DNS, and
+    /// putting it on the wire would map this host's private network one name per request. The variant
+    /// cannot leak it because it never holds it; the address goes to the local log at the refusal site.
+    #[error("refusing a private address: {host} resolves to a non-public address")]
     NonPublic {
         /// The host the request named.
         host: String,
-        /// The first non-public address it resolved to.
-        ip: IpAddr,
     },
     /// The HTTP client could not be built.
     #[error("http client: {0}")]
@@ -372,9 +379,11 @@ async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, FetchError>
         .first()
         .ok_or_else(|| FetchError::NoAddresses(host.to_owned()))?;
     if let Some(bad) = addrs.iter().find(|addr| !is_public(addr.ip())) {
+        // The address stays HERE, in the operator's own log: the wire refusal names only the host the
+        // requester already sent, so this host's internal DNS never crosses to it.
+        tracing::warn!(host, ip = %bad.ip(), "refusing a host that resolves to a non-public address");
         return Err(FetchError::NonPublic {
             host: host.to_owned(),
-            ip: bad.ip(),
         });
     }
     Ok(first)
