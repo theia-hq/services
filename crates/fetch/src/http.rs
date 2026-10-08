@@ -173,17 +173,19 @@ impl FetchRequest {
 #[derive(Debug, thiserror::Error)]
 pub enum RequestReadError {
     /// The stream did not open with [`IDENTITY`], so it is not a fetch stream. The wording is now
-    /// exactly true: it used to cover a fetch peer on another version as well, which it never was.
-    #[error("not a fetch stream")]
+    /// exactly true: it used to cover a fetch peer on another version as well, which it never was. Like
+    /// every error text this wire produces, it names no engine, since a requester may show it to a person.
+    #[error("not a stream this protocol speaks")]
     Foreign,
     /// A fetch stream from a build that speaks a different request grammar.
     ///
     /// This message goes ON THE WIRE via [`answer`](Self::answer), so it is FIXED text plus the two
     /// version tags and nothing else. Never interpolate host state here: the only host fact it may
-    /// carry is this build's own wire version, which any peer learns by being served at all.
+    /// carry is this build's own wire version, which any peer learns by being served at all. Nor does
+    /// it name this engine: the tags identify the grammar, and a requester may echo the text to a person.
     #[error(
-        "fetch wire version mismatch: the request is {peer}, this host speaks {VERSION}; run the \
-         same release at both ends"
+        "wire version mismatch: the request is {peer}, this host speaks {VERSION}; run the same \
+         release at both ends"
     )]
     Version {
         /// The version the peer's frame named.
@@ -263,7 +265,7 @@ impl FetchResponse {
             }
             1 => Ok(Self::Error(read_str(reader).await?)),
             other => Err(io::Error::other(format!(
-                "unknown fetch response tag {other:#04x}"
+                "unknown response tag {other:#04x}"
             ))),
         }
     }
@@ -276,7 +278,7 @@ async fn read_response_tag<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Resu
     let mut tag = [0u8; RESPONSE_TAG.len()];
     reader.read_exact(&mut tag).await?;
     if tag != RESPONSE_TAG {
-        return Err(io::Error::other("not a fetch stream"));
+        return Err(io::Error::other("not a stream this protocol speaks"));
     }
     Ok(())
 }
@@ -306,7 +308,7 @@ async fn read_headers<R: io::AsyncRead + Unpin>(
     // read gigabytes of header strings off an admitted stream.
     if count > MAX_HEADERS {
         return Err(io::Error::other(format!(
-            "fetch frame declares {count} headers (max {MAX_HEADERS})"
+            "frame declares {count} headers (max {MAX_HEADERS})"
         )));
     }
     let mut headers = Vec::with_capacity(count);

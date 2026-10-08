@@ -418,9 +418,9 @@ What a host may put in the message is bounded:
   it.
 - Every other message `MAY` name the requester's **own input** back to it: the method it sent, the URL
   or origin it asked for. Those are already known to the requester and reveal nothing.
-- The SSRF refusal additionally names the **resolved address** that failed the check. That is a
-  resolution result the requester could obtain itself, and naming it is what makes the refusal
-  actionable rather than mysterious.
+- The SSRF refusal names the host the requester asked for and **never** the address it resolved to.
+  That address is the host's own resolution, which may be internal DNS the requester cannot see, so a
+  host `MUST NOT` put it in the message; it `MAY` record it in its own log.
 - A host `MUST NOT` put its operator allowlist, its configuration, its load, or the contents of any
   other request into a message.
 
@@ -626,18 +626,18 @@ vector tbh1-response-ok
 
 ```text
 vector tbh1-response-error-method
-54 42 48 31 01 00 30 6d 65 74 68 6f 64 20 50 4f
-53 54 20 6e 6f 74 20 61 6c 6c 6f 77 65 64 20 28
-66 65 74 63 68 20 69 73 20 47 45 54 2f 48 45 41
-44 20 6f 6e 6c 79 29
+54 42 48 31 01 00 36 6d 65 74 68 6f 64 20 50 4f
+53 54 20 6e 6f 74 20 61 6c 6c 6f 77 65 64 3a 20
+6f 6e 6c 79 20 47 45 54 20 61 6e 64 20 48 45 41
+44 20 61 72 65 20 61 6c 6c 6f 77 65 64
 ```
 
 | octets | field | value |
 | ------ | ----- | ----- |
 | `54 42 48 31` | response tag | the frozen literal |
 | `01` | tag | error |
-| `00 30` | message length | 48 |
-| `6d 65 ... 79 29` | message | `method POST not allowed (fetch is GET/HEAD only)` |
+| `00 36` | message length | 54 |
+| `6d 65 ... 65 64` | message | `method POST not allowed: only GET and HEAD are allowed` |
 
 ### Refused, the target is not public
 
@@ -647,19 +647,19 @@ different prose.
 
 ```text
 vector tbh1-response-error-non-public
-54 42 48 31 01 00 59 72 65 66 75 73 69 6e 67 20
-74 6f 20 66 65 74 63 68 20 6d 65 74 61 64 61 74
-61 2e 65 78 61 6d 70 6c 65 3a 20 69 74 20 72 65
-73 6f 6c 76 65 73 20 74 6f 20 74 68 65 20 6e 6f
-6e 2d 70 75 62 6c 69 63 20 61 64 64 72 65 73 73
-20 31 36 39 2e 32 35 34 2e 31 36 39 2e 32 35 34
+54 42 48 31 01 00 4d 72 65 66 75 73 69 6e 67 20
+61 20 70 72 69 76 61 74 65 20 61 64 64 72 65 73
+73 3a 20 6d 65 74 61 64 61 74 61 2e 65 78 61 6d
+70 6c 65 20 72 65 73 6f 6c 76 65 73 20 74 6f 20
+61 20 6e 6f 6e 2d 70 75 62 6c 69 63 20 61 64 64
+72 65 73 73
 ```
 
 | octets | field | value |
 | ------ | ----- | ----- |
 | `01` | tag | error |
-| `00 59` | message length | 89 |
-| `72 65 ... 35 34` | message | `refusing to fetch metadata.example: it resolves to the non-public address 169.254.169.254` |
+| `00 4d` | message length | 77 |
+| `72 65 ... 73 73` | message | `refusing a private address: metadata.example resolves to a non-public address` |
 
 ### A version mismatch, and the answer to it
 
@@ -678,22 +678,21 @@ are named, because either one alone leaves the reader guessing at the other:
 
 ```text
 vector tbh1-response-version-mismatch
-54 42 48 31 01 00 6a 66 65 74 63 68 20 77 69 72
-65 20 76 65 72 73 69 6f 6e 20 6d 69 73 6d 61 74
-63 68 3a 20 74 68 65 20 72 65 71 75 65 73 74 20
-69 73 20 54 42 48 32 2c 20 74 68 69 73 20 68 6f
-73 74 20 73 70 65 61 6b 73 20 54 42 48 31 3b 20
-72 75 6e 20 74 68 65 20 73 61 6d 65 20 72 65 6c
-65 61 73 65 20 61 74 20 62 6f 74 68 20 65 6e 64
-73
+54 42 48 31 01 00 64 77 69 72 65 20 76 65 72 73
+69 6f 6e 20 6d 69 73 6d 61 74 63 68 3a 20 74 68
+65 20 72 65 71 75 65 73 74 20 69 73 20 54 42 48
+32 2c 20 74 68 69 73 20 68 6f 73 74 20 73 70 65
+61 6b 73 20 54 42 48 31 3b 20 72 75 6e 20 74 68
+65 20 73 61 6d 65 20 72 65 6c 65 61 73 65 20 61
+74 20 62 6f 74 68 20 65 6e 64 73
 ```
 
 | octets | field | value |
 | ------ | ----- | ----- |
 | `54 42 48 31` | response tag | the frozen literal, **not** the peer's `TBH2` and not a future host's own magic |
 | `01` | tag | error |
-| `00 6a` | message length | 106 |
-| `66 65 ... 64 73` | message | `fetch wire version mismatch: the request is TBH2, this host speaks TBH1; run the same release at both ends` |
+| `00 64` | message length | 100 |
+| `77 69 ... 64 73` | message | `wire version mismatch: the request is TBH2, this host speaks TBH1; run the same release at both ends` |
 
 Read the first four octets of that answer against the first four of the head above it. They differ, and
 they are meant to: the head names the peer's request grammar and the answer names the frozen response

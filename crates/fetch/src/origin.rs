@@ -140,7 +140,7 @@ pub enum OriginError {
     Url(#[from] url::ParseError),
     /// The URL carries `user:pass@`. Refused whole, never parsed around, so a host dressed as userinfo (or
     /// the reverse) cannot reach the matcher.
-    #[error("url carries userinfo (user:pass@), which a fetch origin must not")]
+    #[error("url carries userinfo (user:pass@), which an origin must not")]
     Userinfo,
     /// The URL names no host.
     #[error("url has no host")]
