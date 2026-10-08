@@ -3,6 +3,13 @@
 All notable changes to `sshh`, newest first. It carries its own version and its own cadence, so a
 release here moves `sshh` and nothing else in this repository.
 
+## Unreleased
+
+### Changed
+- **Builds russh without its `rsa` feature**, so the rsa crate and its advisory, RUSTSEC-2023-0071,
+  leave your dependency tree unless another crate in it asks for that feature. sshh holds one Ed25519
+  host key and offers only `none` auth, so it never ran an RSA private-key operation.
+
 ## v0.8.0
 
 ### Changed
