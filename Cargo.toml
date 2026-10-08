@@ -13,19 +13,22 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does NOT
 # slow local builds (the patch wins locally regardless of the rev); CI (no parent config) resolves the rev
 # from GitHub. All bifrost-* crates live in one repo, so they share one rev.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "3d1f79e84c7d8480896ef2d83120867de53a3726" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "3d1f79e84c7d8480896ef2d83120867de53a3726" }
 nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "a7c82bf58db5d54795b4a3c544da8ca7d2e0a81c" }
 # The lean handler contract in tightbeam's repo, pinned from the same repo as tightbeam itself. The pin
 # moves with the extraction commit in the family cascade; the same nauthy rev must resolve across services,
 # tightbeam-handler, and tightbeam or the witness types do not match at compile time.
-tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "f82341f17e1191dba6bd4733a72e4f6cc9728b1b" }
+tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", rev = "de0b58d72f9a922358bed3b77c0942d50bbefdd3" }
 
 eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 libc = "0.2"
 pty-process = { version = "0.5.3", features = ["async", "tokio"] }
-russh = "0.63"
+# russh's defaults minus `rsa`, so the rsa crate (RUSTSEC-2023-0071, a timing leak in RSA private-key
+# operations, no fixed release) leaves the graph. sshh is a server with one Ed25519 host key and `none`
+# auth, and runs no client or agent, so it never holds an RSA key to operate on.
+russh = { version = "0.63", default-features = false, features = ["flate2", "aws-lc-rs"] }
 rustix = { version = "1.1", features = ["fs"] }
 ssh-key = { version = "=0.7.0-rc.11", features = ["ed25519"] }
 thiserror = "2"

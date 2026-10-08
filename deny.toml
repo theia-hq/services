@@ -1,0 +1,35 @@
+# cargo-deny policy: the sources allow-list (Track C, release-robustness-spec.md §2) and advisories.
+#
+# The hand-rolled scripts/lock-guard.sh owns path-drift, sibling rev, and own-version skew. This
+# owns the complementary SUPPLY-CHAIN question it does not: no crate may resolve from an
+# unexpected git host or registry (a typosquat, a hijacked mirror, an accidental `git = "a-fork"`).
+# Only our own siblings (github.com/theia-hq) and crates.io are allowed by source.
+#
+# bans and licenses stay out of scope. Run: cargo deny check sources advisories
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+
+# Allow the whole theia-hq GitHub ORG (every sibling: bifrost, nauthy, ...), which is exactly the
+# ratified trust boundary stated above. A bare `allow-git = ["https://github.com/theia-hq"]` does NOT
+# express this: cargo-deny's `allow-git` matches a FULL repository URL, so an org-only prefix matches no
+# source at all (each sibling resolves from `github.com/theia-hq/<repo>`, and cargo-deny warns
+# `unmatched-source`). `allow-org.github` is the org-level match cargo-deny provides for precisely this
+# "our whole org is trusted" case; the trust surface is the theia-hq org and crates.io.
+[sources.allow-org]
+github = ["theia-hq"]
+
+# Advisories against the resolved graph, checked on every push, every pull request and daily
+# (.github/workflows/advisories.yml), because an advisory filed against an unchanged lock must still
+# turn the build red. This repo locks none of the forks scripts/fork-watch.sh watches in the repos
+# that lock them (noq, noq-proto, noq-udp, tokio-rustls-acme), so it runs no fork watch; the day one
+# of them enters Cargo.lock, the watch and its rows come with it.
+# Each ignore says why the advisory does not reach us; drop it when that stops being true.
+[advisories]
+yanked = "deny"
+ignore = [
+    # proc-macro-error2 is unmaintained, and no fix exists. A build-time proc macro, reached through
+    # nauthy's biscuit-auth (biscuit-quote), so none of its code runs in a built binary.
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time proc macro, via biscuit-auth's biscuit-quote" },
+]
