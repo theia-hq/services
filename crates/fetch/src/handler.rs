@@ -90,10 +90,14 @@ impl Handler for ScopedFetch {
 )]
 pub struct EmptyScope;
 
+const fn assert_open_safe<P: PublicUse>() {
+    assert!(P::OPEN_SAFE);
+}
+
 /// The two ceilings, asserted at compile time: flipping either would open a relay an operator cannot bound,
 /// or gate a service that is safe to open deliberately.
 const _: () = assert!(!<<Fetch as Handler>::Exposure as PublicUse>::OPEN_SAFE);
-const _: () = assert!(<<ScopedFetch as Handler>::Exposure as PublicUse>::OPEN_SAFE);
+const _: () = assert_open_safe::<<ScopedFetch as Handler>::Exposure>();
 
 #[cfg(test)]
 mod handler_tests {

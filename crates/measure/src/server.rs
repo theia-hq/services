@@ -471,11 +471,15 @@ fn contract_error(error: impl core::error::Error + Send + Sync + 'static) -> Ser
     ServeError::Io(std::io::Error::other(error))
 }
 
+const fn assert_open_safe<P: PublicUse>() {
+    assert!(P::OPEN_SAFE);
+}
+
 /// The exposure coupling, asserted at compile time: the metered engines are openable, and the owner
 /// engines are NOT. Flipping either would let an uncapped ping/speed face an open gate, or gate the
 /// engines an operator may deliberately open.
-const _: () = assert!(<<MeteredPing as Handler>::Exposure as PublicUse>::OPEN_SAFE);
-const _: () = assert!(<<MeteredSpeed as Handler>::Exposure as PublicUse>::OPEN_SAFE);
+const _: () = assert_open_safe::<<MeteredPing as Handler>::Exposure>();
+const _: () = assert_open_safe::<<MeteredSpeed as Handler>::Exposure>();
 const _: () = assert!(!<<Serve<Ping> as Handler>::Exposure as PublicUse>::OPEN_SAFE);
 const _: () = assert!(!<<Serve<Speed> as Handler>::Exposure as PublicUse>::OPEN_SAFE);
 
