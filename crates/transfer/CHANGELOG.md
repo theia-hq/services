@@ -6,6 +6,7 @@ release here moves `transfer` and nothing else in this repository.
 ## Unreleased
 
 ### Changed
+- Updated rustix to address RUSTSEC-2026-0486.
 - **The transfer wire moved in, as `transfer::wire`.** A sender pushes with `wire::Transfer::send`, and
   `transfer` no longer depends on bifrost. The bytes are unchanged: a frame still opens with `BFW1`.
 - **A push is answered only after the file lands.** A push the receiver refuses after reading the frame's
