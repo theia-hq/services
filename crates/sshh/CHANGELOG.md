@@ -6,6 +6,7 @@ release here moves `sshh` and nothing else in this repository.
 ## Unreleased
 
 ### Changed
+- Updated the SSH dependency to the russh 0.65 series following RUSTSEC-2026-0495.
 - **Builds russh without its `rsa` feature**, so sshh no longer pulls the rsa crate, or its advisory
   RUSTSEC-2023-0071, into your dependency tree. sshh holds one Ed25519 host key and offers only `none`
   auth, so it never ran an RSA private-key operation.
