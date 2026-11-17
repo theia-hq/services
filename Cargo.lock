@@ -154,7 +154,7 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.8.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=e8a7fb3bb9754f008712d7098318c95bbd52a076#e8a7fb3bb9754f008712d7098318c95bbd52a076"
+source = "git+https://github.com/theia-hq/bifrost?rev=ba2ce7e94767ee4820dc09d7d1447846cf0247a8#ba2ce7e94767ee4820dc09d7d1447846cf0247a8"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -164,7 +164,7 @@ dependencies = [
 [[package]]
 name = "bifrost-core"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=e8a7fb3bb9754f008712d7098318c95bbd52a076#e8a7fb3bb9754f008712d7098318c95bbd52a076"
+source = "git+https://github.com/theia-hq/bifrost?rev=ba2ce7e94767ee4820dc09d7d1447846cf0247a8#ba2ce7e94767ee4820dc09d7d1447846cf0247a8"
 dependencies = [
  "data-encoding",
  "ed25519-dalek 2.2.0",
@@ -176,7 +176,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mem"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=e8a7fb3bb9754f008712d7098318c95bbd52a076#e8a7fb3bb9754f008712d7098318c95bbd52a076"
+source = "git+https://github.com/theia-hq/bifrost?rev=ba2ce7e94767ee4820dc09d7d1447846cf0247a8#ba2ce7e94767ee4820dc09d7d1447846cf0247a8"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -187,7 +187,7 @@ dependencies = [
 [[package]]
 name = "bifrost-transport"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=e8a7fb3bb9754f008712d7098318c95bbd52a076#e8a7fb3bb9754f008712d7098318c95bbd52a076"
+source = "git+https://github.com/theia-hq/bifrost?rev=ba2ce7e94767ee4820dc09d7d1447846cf0247a8#ba2ce7e94767ee4820dc09d7d1447846cf0247a8"
 dependencies = [
  "bifrost-core",
  "tokio",
@@ -196,7 +196,7 @@ dependencies = [
 [[package]]
 name = "bifrost-wire"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=e8a7fb3bb9754f008712d7098318c95bbd52a076#e8a7fb3bb9754f008712d7098318c95bbd52a076"
+source = "git+https://github.com/theia-hq/bifrost?rev=ba2ce7e94767ee4820dc09d7d1447846cf0247a8#ba2ce7e94767ee4820dc09d7d1447846cf0247a8"
 dependencies = [
  "blake3",
  "thiserror",
@@ -2607,7 +2607,7 @@ dependencies = [
 [[package]]
 name = "tightbeam-handler"
 version = "0.4.0"
-source = "git+https://github.com/theia-hq/tightbeam?rev=7ae1c45247b212828732eaeb08aa30faee5313a4#7ae1c45247b212828732eaeb08aa30faee5313a4"
+source = "git+https://github.com/theia-hq/tightbeam?rev=0e7df318725c44502fa0184bcddbb0691628dfeb#0e7df318725c44502fa0184bcddbb0691628dfeb"
 dependencies = [
  "bifrost-core",
  "nauthy",
