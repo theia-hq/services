@@ -29,4 +29,7 @@ ignore = [
     # proc-macro-error2 is unmaintained, and no fix exists. A build-time proc macro, reached through
     # nauthy's biscuit-auth (biscuit-quote), so none of its code runs in a built binary.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time proc macro, via biscuit-auth's biscuit-quote" },
+    # chrono is unmaintained, and no fix exists. Reached through russh's russh-util, which uses it only
+    # in a wasm32 clock shim. No wasm32 target is built here, so it is never compiled.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, wasm32-only via russh's russh-util; never compiled" },
 ]
