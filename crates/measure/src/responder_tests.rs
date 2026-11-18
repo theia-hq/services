@@ -10,9 +10,9 @@ use tokio::time;
 
 use super::{
     PING_BYTE_CAP_DETAIL, PING_TIME_CAP_DETAIL, PingCaps, SPEED_BYTE_CAP_DETAIL, SpeedCaps,
-    answer_ping, answer_speed,
+    answer_ping, answer_speed, respond_ping, respond_speed,
 };
-use crate::protocol::{MethodRefusal, ProtocolError, Request, Response};
+use crate::protocol::{MethodRefusal, Opening, ProtocolError, Request, Response};
 
 /// The in-memory stream capacity. Small, so an unbounded source fills it and parks on backpressure.
 const CAPACITY: usize = 1024;
@@ -424,5 +424,237 @@ async fn a_version_skewed_peer_is_answered_not_dropped() {
     assert!(
         matches!(result, Err(ProtocolError::Version { .. })),
         "the host still fails the stream and logs why: {result:?}"
+    );
+}
+
+/// The server halves, held by the responder task past the body so only the body's own `shutdown` can
+/// end the client's read. Dropping a half closes the in-memory stream too, which would read as the same
+/// clean end with or without a shutdown, so a row that let the halves drop could never go red.
+type Held = tokio::task::JoinHandle<(
+    Result<(), ProtocolError>,
+    io::ReadHalf<DuplexStream>,
+    io::WriteHalf<DuplexStream>,
+)>;
+
+/// Which entry a held responder runs: the raw door reads the opening frame off the stream, the typed
+/// door is handed it already decoded. Both end their stream on their own, so each row runs both.
+#[derive(Debug, Clone, Copy)]
+enum Door {
+    Raw,
+    Typed,
+}
+
+/// A speed responder on `door` that has been asked `request`, its server halves outliving the body.
+async fn open_speed(caps: SpeedCaps, door: Door, request: Request) -> (DuplexStream, Held) {
+    let (mut client, server) = io::duplex(CAPACITY);
+    let (mut server_read, mut server_write) = io::split(server);
+    let task = tokio::spawn(async move {
+        let served = match door {
+            Door::Raw => answer_speed(&mut server_write, &mut server_read, caps).await,
+            Door::Typed => {
+                let opening = Opening::Spoken(request);
+                respond_speed(opening, &mut server_write, &mut server_read, caps).await
+            }
+        };
+        (served, server_read, server_write)
+    });
+    if let Door::Raw = door {
+        request
+            .write(&mut client)
+            .await
+            .expect("the request frame fits the stream");
+    }
+    (client, task)
+}
+
+/// A ping responder on `door` that has been sent `request`, its server halves outliving the body.
+async fn open_ping(caps: PingCaps, door: Door, request: Request) -> (DuplexStream, Held) {
+    let (mut client, server) = io::duplex(CAPACITY);
+    let (mut server_read, mut server_write) = io::split(server);
+    let task = tokio::spawn(async move {
+        let served = match door {
+            Door::Raw => answer_ping(&mut server_write, &mut server_read, caps).await,
+            Door::Typed => {
+                let opening = Opening::Spoken(request);
+                respond_ping(opening, &mut server_write, &mut server_read, caps).await
+            }
+        };
+        (served, server_read, server_write)
+    });
+    if let Door::Raw = door {
+        request
+            .write(&mut client)
+            .await
+            .expect("the ping frame fits the stream");
+    }
+    (client, task)
+}
+
+/// A raw-door ping responder that has been sent nothing yet, its server halves outliving the body.
+fn silent_ping(caps: PingCaps) -> (DuplexStream, Held) {
+    let (client, server) = io::duplex(CAPACITY);
+    let (mut server_read, mut server_write) = io::split(server);
+    let task = tokio::spawn(async move {
+        let served = answer_ping(&mut server_write, &mut server_read, caps).await;
+        (served, server_read, server_write)
+    });
+    (client, task)
+}
+
+/// A raw-door speed responder that has been sent nothing yet, its server halves outliving the body.
+fn silent_speed(caps: SpeedCaps) -> (DuplexStream, Held) {
+    let (client, server) = io::duplex(CAPACITY);
+    let (mut server_read, mut server_write) = io::split(server);
+    let task = tokio::spawn(async move {
+        let served = answer_speed(&mut server_write, &mut server_read, caps).await;
+        (served, server_read, server_write)
+    });
+    (client, task)
+}
+
+/// Read what is left of the stream, to its end. With the server halves held, the end arrives only
+/// through the responder's `shutdown`; a stream left unshut stalls, and the bound turns that stall into
+/// the failure.
+async fn read_to_the_end(client: &mut DuplexStream) -> Vec<u8> {
+    let mut rest = Vec::new();
+    time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+        .await
+        .expect(
+            "the responder ends its stream with shutdown, so the peer reads an end, not a stall",
+        )
+        .expect("a clean end, not a reset");
+    rest
+}
+
+/// The ping a row opens with.
+const PING: Request = Request::Ping {
+    seq: 1,
+    sent_unix_nanos: 2,
+};
+
+/// A ping run the client ends reads a clean end after its last echo, on either door. Drop the
+/// `shutdown` on either door's success path and the read stalls behind the held halves.
+#[tokio::test(start_paused = true)]
+async fn a_finished_ping_run_ends_with_a_clean_end() {
+    for door in [Door::Raw, Door::Typed] {
+        let (mut client, serving) = open_ping(PingCaps::default(), door, PING).await;
+        let pong = Response::read(&mut client).await.expect("the echo");
+        assert!(
+            matches!(pong, Response::Pong { seq: 1, .. }),
+            "{door:?}: {pong:?}"
+        );
+        client.shutdown().await.expect("the client ends its run");
+
+        let rest = read_to_the_end(&mut client).await;
+        assert!(rest.is_empty(), "{door:?}: nothing follows the last echo");
+        let (served, _read, _write) = serving.await.expect("the responder task does not panic");
+        assert!(served.is_ok(), "{door:?}: {served:?}");
+    }
+}
+
+/// A finished speed download reads its whole payload and then a clean end, on either door, so a client
+/// counting to the end of the stream counts exactly what was sourced.
+#[tokio::test(start_paused = true)]
+async fn a_finished_speed_run_ends_with_a_clean_end() {
+    let request = Request::SpeedSource {
+        limit_bytes: Some(4096),
+    };
+    for door in [Door::Raw, Door::Typed] {
+        let (mut client, serving) = open_speed(SpeedCaps::default(), door, request).await;
+        let go = Response::read(&mut client).await.expect("the go-ahead");
+        assert!(matches!(go, Response::Sourcing), "{door:?}: {go:?}");
+
+        let rest = read_to_the_end(&mut client).await;
+        assert_eq!(rest.len(), 4096, "{door:?}: the payload, then the end");
+        let (served, _read, _write) = serving.await.expect("the responder task does not panic");
+        assert!(served.is_ok(), "{door:?}: {served:?}");
+    }
+}
+
+/// A stream whose cap fires before its opening frame arrives served nothing, and still ends cleanly:
+/// the shutdown runs after the deadline has passed, and one try is all it needs. Drop the `shutdown`
+/// on that early return and the read stalls.
+#[tokio::test(start_paused = true)]
+async fn a_stream_capped_before_its_opening_ends_with_a_clean_end() {
+    let cap = Duration::from_secs(1);
+    let (mut ping, ping_serving) = silent_ping(PingCaps {
+        max_bytes: None,
+        max_duration: Some(cap),
+    });
+    let (mut speed, speed_serving) = silent_speed(capped_at(cap));
+    for (name, client, serving) in [
+        ("ping", &mut ping, ping_serving),
+        ("speed", &mut speed, speed_serving),
+    ] {
+        assert!(
+            read_to_the_end(client).await.is_empty(),
+            "{name}: nothing was served"
+        );
+        let (served, _read, _write) = serving.await.expect("the responder task does not panic");
+        assert!(served.is_ok(), "{name}: {served:?}");
+    }
+}
+
+/// A refusal is a clean end: the peer reads the typed frame and then the end of the stream, while the
+/// host still fails the stream task so it logs why. Drop the `shutdown` in `refuse` and the read stalls.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_ends_with_a_clean_end() {
+    let cap = 8 * 1024u64;
+    let request = Request::SpeedSource {
+        limit_bytes: Some(cap + 1),
+    };
+    let (mut client, serving) = open_speed(capped_at_bytes(cap), Door::Raw, request).await;
+    let refusal = Response::read(&mut client)
+        .await
+        .expect("the refusal frame");
+    assert!(
+        matches!(
+            refusal,
+            Response::Unsupported {
+                code: MethodRefusal::RateLimited,
+                ..
+            }
+        ),
+        "{refusal:?}"
+    );
+
+    assert!(
+        read_to_the_end(&mut client).await.is_empty(),
+        "nothing follows the refusal"
+    );
+    let (served, _read, _write) = serving.await.expect("the responder task does not panic");
+    assert!(
+        matches!(served, Err(ProtocolError::WrongService)),
+        "{served:?}"
+    );
+}
+
+/// The answer to a version-skewed peer is a refusal too, so it ends cleanly behind its frame. Drop the
+/// `shutdown` after the answer and the read stalls.
+#[tokio::test(start_paused = true)]
+async fn a_version_answer_ends_with_a_clean_end() {
+    let (mut client, serving) = silent_ping(PingCaps::default());
+    let mut frame = Vec::new();
+    PING.write(&mut frame)
+        .await
+        .expect("a request frame fits a vec");
+    frame[3] = b'3';
+    client
+        .write_all(&frame)
+        .await
+        .expect("the frame fits the stream");
+    let answer = Response::read(&mut client)
+        .await
+        .expect("the version answer");
+    assert!(matches!(answer, Response::Unsupported { .. }), "{answer:?}");
+
+    assert!(
+        read_to_the_end(&mut client).await.is_empty(),
+        "nothing follows the answer"
+    );
+    let (served, _read, _write) = serving.await.expect("the responder task does not panic");
+    assert!(
+        matches!(served, Err(ProtocolError::Version { .. })),
+        "{served:?}"
     );
 }

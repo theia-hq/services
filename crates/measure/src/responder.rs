@@ -13,6 +13,7 @@ use core::time::Duration;
 
 use bifrost::RefusalDetail;
 use tightbeam_handler::wire::read_frame;
+use tokio::io::AsyncWriteExt as _;
 use tokio::{io, time};
 
 use crate::payload::Payload;
@@ -109,9 +110,10 @@ where
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
     let Some(opening) = read_opening(&mut reader, deadline).await? else {
         // The cap fired before a probe arrived; nothing was served, so the stream just closes.
-        return Ok(());
+        return close(&mut writer, deadline).await;
     };
-    ping_body(&mut writer, &mut reader, opening, caps, deadline).await
+    ping_body(&mut writer, &mut reader, opening, caps, deadline).await?;
+    close(&mut writer, deadline).await
 }
 
 /// Answer one inbound stream on the `ping` service whose opening frame HAS ALREADY BEEN READ: the
@@ -131,7 +133,8 @@ where
     R: io::AsyncRead + Unpin,
 {
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
-    ping_body(&mut writer, &mut reader, opening, caps, deadline).await
+    ping_body(&mut writer, &mut reader, opening, caps, deadline).await?;
+    close(&mut writer, deadline).await
 }
 
 /// Everything a ping stream does once its opening frame exists, shared by both doors.
@@ -185,9 +188,10 @@ where
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
     let Some(opening) = read_opening(&mut reader, deadline).await? else {
         // The cap fired before a method arrived; close cleanly, nothing was served.
-        return Ok(());
+        return close(&mut writer, deadline).await;
     };
-    speed_body(&mut writer, &mut reader, opening, caps, deadline).await
+    speed_body(&mut writer, &mut reader, opening, caps, deadline).await?;
+    close(&mut writer, deadline).await
 }
 
 /// Answer one inbound stream on the `speed` service whose opening frame HAS ALREADY BEEN READ: the
@@ -205,7 +209,8 @@ where
     R: io::AsyncRead + Unpin,
 {
     let deadline = caps.max_duration.map(|cap| time::Instant::now() + cap);
-    speed_body(&mut writer, &mut reader, opening, caps, deadline).await
+    speed_body(&mut writer, &mut reader, opening, caps, deadline).await?;
+    close(&mut writer, deadline).await
 }
 
 /// Everything a speed stream does once its opening frame exists, shared by both doors.
@@ -280,6 +285,9 @@ where
         return Err(error);
     };
     answer.write(writer).await?;
+    // The answer is a refusal, so it ends the stream cleanly: an unshut writer resets the peer, and a
+    // reset can discard the answer before the peer reads it.
+    writer.shutdown().await?;
     Err(error)
 }
 
@@ -411,7 +419,31 @@ pub(crate) async fn refuse<W: io::AsyncWrite + Unpin>(
     }
     .write(writer)
     .await?;
+    // A refusal is a clean end, not a failed stream: shut the writer down so the peer reads the frame in
+    // full and then the end, where an unshut writer resets it and can discard the frame.
+    writer.shutdown().await?;
     Err(ProtocolError::WrongService)
+}
+
+/// End a served stream with `shutdown`. A handler ends its stream this way: the peer reads a clean end
+/// only after a successful shutdown, and a writer left unshut resets it. Called on the success path
+/// alone, because a stream that failed should reset rather than read as a finished run.
+///
+/// Bounded by the stream deadline like every other write at the cap. A past deadline still gets one
+/// try, which is all a shutdown with nothing left to flush needs; a writer that would park there is
+/// behind a peer that stopped reading, so it is left unshut and the peer reads a reset, which is true.
+async fn close<W>(writer: &mut W, deadline: Option<time::Instant>) -> Result<(), ProtocolError>
+where
+    W: io::AsyncWrite + Unpin,
+{
+    match deadline {
+        Some(deadline) => match time::timeout_at(deadline, writer.shutdown()).await {
+            Ok(closed) => closed?,
+            Err(_past_deadline) => {}
+        },
+        None => writer.shutdown().await?,
+    }
+    Ok(())
 }
 
 /// Drain the client's upload to `limit_bytes` (or to EOF when `None`), stopping at `deadline` when one

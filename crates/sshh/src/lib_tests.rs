@@ -231,13 +231,26 @@ async fn connect() -> (
     russh::client::Handle<Client>,
     tokio::task::JoinHandle<Result<(), ServeError>>,
 ) {
+    connect_through(|writer| writer).await
+}
+
+/// [`connect`], with the session writing through whatever `wrap` makes of its write half.
+async fn connect_through<W>(
+    wrap: impl FnOnce(io::WriteHalf<io::DuplexStream>) -> W,
+) -> (
+    russh::client::Handle<Client>,
+    tokio::task::JoinHandle<Result<(), ServeError>>,
+)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     // Room for a whole test's traffic each way. Both ends here are russh, whose session loop stops
     // reading while a write to the stream is pending, so with both directions busy (a MiB in while a
     // child's output streams out) a small in-memory pipe fills on both sides and wedges both loops. A real
     // `ssh` client reads while it writes and never meets the other in that state.
     let (client_end, server_end) = io::duplex(16 * 1024 * 1024);
     let (reader, writer) = io::split(server_end);
-    let server = tokio::spawn(session([7; 32], writer, reader));
+    let server = tokio::spawn(session([7; 32], wrap(writer), reader));
     let config = std::sync::Arc::new(russh::client::Config::default());
     let mut client = russh::client::connect_stream(config, client_end, Client)
         .await
@@ -623,5 +636,70 @@ async fn a_pipe_exec_probe_under_a_terminal() {
         matches!(seen.status, Some(code) if code != 0),
         "a piped child cannot open a terminal: {:?}",
         seen.status
+    );
+}
+
+/// A write half that records a successful `shutdown`. The session's halves drop when it ends, and a
+/// dropped in-memory half reads as the same clean end as a shut one, so a peer-side read cannot tell the
+/// two apart; the record can.
+struct Recorded<W> {
+    inner: W,
+    shut: std::sync::Arc<core::sync::atomic::AtomicBool>,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Recorded<W> {
+    fn poll_write(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &[u8],
+    ) -> core::task::Poll<io::Result<usize>> {
+        core::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<io::Result<()>> {
+        core::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<io::Result<()>> {
+        let shut = core::task::ready!(core::pin::Pin::new(&mut self.inner).poll_shutdown(cx));
+        if shut.is_ok() {
+            self.shut.store(true, Ordering::Release);
+        }
+        core::task::Poll::Ready(shut)
+    }
+}
+
+/// A session the client ends cleanly shuts its writer down before the handler returns, so the peer's
+/// stream ends cleanly rather than resetting. Swallow the shutdown on the session's writer and this goes
+/// red.
+#[tokio::test]
+async fn a_clean_session_end_shuts_the_writer_down() {
+    let shut = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let recorded = std::sync::Arc::clone(&shut);
+    let (client, server) = connect_through(move |inner| Recorded {
+        inner,
+        shut: recorded,
+    })
+    .await;
+    client
+        .disconnect(russh::Disconnect::ByApplication, "", "")
+        .await
+        .expect("the disconnect is sent");
+    drop(client);
+
+    let served = tokio::time::timeout(EXEC_LIMIT, server)
+        .await
+        .expect("a disconnected session ends on its own")
+        .expect("the session task does not panic");
+    assert!(served.is_ok(), "{served:?}");
+    assert!(
+        shut.load(Ordering::Acquire),
+        "the session's end shut its writer down"
     );
 }
