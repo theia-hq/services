@@ -158,7 +158,7 @@ async fn speed_moves_bytes_in_each_direction() {
 #[tokio::test]
 async fn bidir_moves_bytes_in_both_directions_at_once() {
     // Full-duplex on the one stream: both legs move counted bytes over the same window. This is the
-    // path that must also work over a single-stream transport (quirk); mem proves the mechanism.
+    // path that must also work over a single-stream transport (iroh); mem proves the mechanism.
     let (serving, session) = paired().await.expect("client should reach the responder");
     let limit_bytes = 4 * 1024 * 1024;
 

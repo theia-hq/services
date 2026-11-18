@@ -115,11 +115,10 @@ const CHUNK: usize = 64 * 1024;
 ///
 /// The clock starts when the sender's half is shut down, and on a real transport that returns while the
 /// transport still holds bytes it has not delivered: a QUIC connection's default send window is 10 MB,
-/// shared by every stream on it, and a Noise session queues up to 64 frames of 16 KiB ahead of a
-/// stop-and-wait stream. The receiver answers only after the last of those bytes arrives and the file
-/// lands. Ten minutes drains 10 MB down to about 133 kbit/s; a shorter wait reports an honest slow push
-/// as failed after it landed, and its retry then finds the name taken. It is bounded at all only so that
-/// a receiver that takes the body and never answers cannot hold the sender, and every stream it has
+/// shared by every stream on it. The receiver answers only after the last of those bytes arrives and the
+/// file lands. Ten minutes drains 10 MB down to about 133 kbit/s; a shorter wait reports an honest slow
+/// push as failed after it landed, and its retry then finds the name taken. It is bounded at all only so
+/// that a receiver that takes the body and never answers cannot hold the sender, and every stream it has
 /// open, forever.
 const ACK_DEADLINE: Duration = Duration::from_secs(10 * 60);
 

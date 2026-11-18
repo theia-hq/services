@@ -2,7 +2,7 @@
 //! any bifrost transport. It opens one stream and, depending on [`Mode`], asks the responder to sink
 //! (upload), source (download), or mirror (bidir) a payload, moves counted bytes until a byte or time
 //! bound, and reports MiB/s. Bidir moves both directions at once on the one stream, so it measures
-//! upload and download simultaneously and works over a single-stream transport (quirk).
+//! upload and download simultaneously and works over a single-stream transport (iroh).
 
 use core::time::Duration;
 use std::time::Instant;
@@ -246,8 +246,8 @@ where
 /// Upload here is client-sent bytes (there is no `Received` confirmation frame in this mode, since a
 /// reply frame appended to the source payload would corrupt the download count); a reliable stream
 /// delivers what was sent, so sent bytes are the honest upload figure. A byte-bounded run either moves
-/// the whole ask in both directions or ends with the typed short-stream error. Works over quirk: a
-/// single bidirectional stream carries both halves.
+/// the whole ask in both directions or ends with the typed short-stream error. Works over iroh and the
+/// test-only mem backend: a single bidirectional stream carries both halves.
 async fn bidir<W, R>(
     writer: &mut W,
     reader: &mut R,

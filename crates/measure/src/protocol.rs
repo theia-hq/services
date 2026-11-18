@@ -117,7 +117,7 @@ pub enum Request {
         limit_bytes: Option<u64>,
     },
     /// Full-duplex speed: both ends send and drain counted payload at once on this one stream, so it
-    /// measures upload and download simultaneously and works over a single-stream transport (quirk).
+    /// measures upload and download simultaneously and works over a single-stream transport (iroh).
     /// The responder mirrors the client: it drains the client's upload to EOF while sourcing its own
     /// download, `Some(n)` bytes for a byte bound or unbounded for a time bound, where the client's
     /// close of its read half ends the responder's source. Encoded with the [`UNBOUNDED`] sentinel like
