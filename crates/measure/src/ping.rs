@@ -36,7 +36,7 @@ use crate::protocol::{ProtocolError, Refusal, Request, Response};
 /// bound can only reach a peer that already stopped taking bytes, whose run is loss either way.
 ///
 /// Ten seconds is the family's patience for one network step (the dial, the tunnel's admission read,
-/// the noise handshake), and a probe is one network step. It is far above the worst honest round trip,
+/// the transport handshake), and a probe is one network step. It is far above the worst honest round trip,
 /// a relayed intercontinental path with a hole-punch still in flight, and short enough that a run
 /// against a wedged peer answers while the person who typed it is still watching.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
