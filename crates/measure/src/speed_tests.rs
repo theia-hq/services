@@ -6,11 +6,12 @@
 use core::time::Duration;
 use std::time::Instant;
 
-use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
+use bifrost::RefusalDetail;
+use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _, ReadHalf};
 use tokio::time;
 
-use super::{Limit, STALL_BOUND, bidir, download, upload};
-use crate::protocol::{ProtocolError, Request, Response};
+use super::{Limit, Mode, STALL_BOUND, Speedtest, bidir, download, upload};
+use crate::protocol::{MethodRefusal, ProtocolError, Refusal, Request, Response};
 
 /// A stalled byte-bounded download must end at the stall bound with the typed error, not park: the shape
 /// a live run takes when a metered source stops at its lifetime cap and the close never reaches the
@@ -248,4 +249,154 @@ async fn a_time_bounded_short_close_is_not_a_shortfall() {
         .await
         .expect("the server task does not panic")
         .expect("the server wrote its half");
+}
+
+/// How long a responder waits to read a failed run's clean end. The clock is paused, so this fires
+/// only once every task is parked: the end never came.
+const END_BOUND: Duration = Duration::from_secs(1);
+
+/// The responder's side of a run's stream: it must read to a clean end, never park.
+///
+/// The double is a split duplex, whose write half closes nothing when dropped while the run's caller
+/// still holds the read half. Each row's caller holds both halves past the run, so the end arrives
+/// only if the run itself shut its writer: a run that left it unshut parks this read until the bound.
+async fn reads_a_clean_end(mut server_read: ReadHalf<io::DuplexStream>) {
+    let mut rest = Vec::new();
+    time::timeout(END_BOUND, server_read.read_to_end(&mut rest))
+        .await
+        .expect("a run must end its write half, not leave the responder parked")
+        .expect("a run's stream ends cleanly, never with an error");
+}
+
+/// A refused upload ends its stream: the responder that wrote the typed refusal reads the payload
+/// already sent, then a clean end.
+#[tokio::test(start_paused = true)]
+async fn a_refused_run_still_ends_its_stream_cleanly() {
+    let (client, server) = io::duplex(1024);
+    let (mut client_read, mut client_write) = io::split(client);
+    let (mut server_read, mut server_write) = io::split(server);
+    let serving = tokio::spawn(async move {
+        let _ = Request::read(&mut server_read).await;
+        Response::Unsupported {
+            code: MethodRefusal::Busy,
+            detail: RefusalDetail::bounded("a transfer slot is busy"),
+        }
+        .write(&mut server_write)
+        .await?;
+        reads_a_clean_end(server_read).await;
+        Ok::<(), ProtocolError>(())
+    });
+
+    let outcome = Speedtest::new(Mode::Up, Limit::ByBytes(64 * 1024))
+        .over(&mut client_write, &mut client_read)
+        .await;
+    assert!(
+        matches!(outcome, Err(ProtocolError::Refused(Refusal::Method { .. }))),
+        "a refused upload surfaces the typed refusal: {outcome:?}"
+    );
+    serving
+        .await
+        .expect("the responder reads a clean end")
+        .expect("the responder wrote its refusal");
+}
+
+/// An upload the sink answered early with a short count ends its stream: the responder reads a
+/// clean end after its `Received`, not a stream left open behind the typed error.
+#[tokio::test(start_paused = true)]
+async fn an_early_received_still_ends_its_stream_cleanly() {
+    let asked = 8 * 1024u64;
+    let (client, server) = io::duplex(1024);
+    let (mut client_read, mut client_write) = io::split(client);
+    let (mut server_read, mut server_write) = io::split(server);
+    let serving = tokio::spawn(async move {
+        let _ = Request::read(&mut server_read).await;
+        let mut taken = [0u8; 4 * 1024];
+        server_read.read_exact(&mut taken).await?;
+        Response::Received { bytes: 4 * 1024 }
+            .write(&mut server_write)
+            .await?;
+        reads_a_clean_end(server_read).await;
+        Ok::<(), ProtocolError>(())
+    });
+
+    let outcome = Speedtest::new(Mode::Up, Limit::ByBytes(asked))
+        .over(&mut client_write, &mut client_read)
+        .await;
+    assert!(
+        matches!(outcome, Err(ProtocolError::EndedEarly { .. })),
+        "an early short count surfaces the typed error: {outcome:?}"
+    );
+    serving
+        .await
+        .expect("the responder reads a clean end")
+        .expect("the responder wrote its count");
+}
+
+/// A download that came up short ends its stream: the client errors before the shutdown a full run
+/// reaches, and the responder still reads a clean end.
+#[tokio::test(start_paused = true)]
+async fn a_short_download_still_ends_its_stream_cleanly() {
+    let (client, server) = io::duplex(1024);
+    let (mut client_read, mut client_write) = io::split(client);
+    let (mut server_read, mut server_write) = io::split(server);
+    let serving = tokio::spawn(async move {
+        let _ = Request::read(&mut server_read).await;
+        Response::Sourcing.write(&mut server_write).await?;
+        server_write.write_all(&[0u8; 4 * 1024]).await?;
+        server_write.shutdown().await?;
+        reads_a_clean_end(server_read).await;
+        Ok::<(), ProtocolError>(())
+    });
+
+    let outcome = Speedtest::new(Mode::Down, Limit::ByBytes(8 * 1024))
+        .over(&mut client_write, &mut client_read)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(ProtocolError::EndedEarly {
+                moved: 4096,
+                asked: 8192
+            })
+        ),
+        "a short download surfaces the typed error: {outcome:?}"
+    );
+    serving
+        .await
+        .expect("the responder reads a clean end")
+        .expect("the responder sourced its bytes");
+}
+
+/// A time-bounded upload the sink answered early is a result, not an error, and it still ends its
+/// stream: the responder reads a clean end after its `Received`.
+#[tokio::test(start_paused = true)]
+async fn an_early_answer_to_a_timed_upload_still_ends_its_stream_cleanly() {
+    let (client, server) = io::duplex(1024);
+    let (mut client_read, mut client_write) = io::split(client);
+    let (mut server_read, mut server_write) = io::split(server);
+    let serving = tokio::spawn(async move {
+        let _ = Request::read(&mut server_read).await;
+        let mut taken = [0u8; 4 * 1024];
+        server_read.read_exact(&mut taken).await?;
+        Response::Received { bytes: 4 * 1024 }
+            .write(&mut server_write)
+            .await?;
+        reads_a_clean_end(server_read).await;
+        Ok::<(), ProtocolError>(())
+    });
+
+    let outcome = Speedtest::new(Mode::Up, Limit::ByTime(Duration::from_secs(5)))
+        .over(&mut client_write, &mut client_read)
+        .await;
+    assert_eq!(
+        outcome
+            .expect("a timed upload reports the count the sink confirmed")
+            .up()
+            .map(|up| up.bytes()),
+        Some(4 * 1024)
+    );
+    serving
+        .await
+        .expect("the responder reads a clean end")
+        .expect("the responder wrote its count");
 }

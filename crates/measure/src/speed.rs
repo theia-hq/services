@@ -4,6 +4,7 @@
 //! bound, and reports MiB/s. Bidir moves both directions at once on the one stream, so it measures
 //! upload and download simultaneously and works over a single-stream transport (iroh).
 
+use core::ops::ControlFlow;
 use core::time::Duration;
 use std::time::Instant;
 
@@ -94,24 +95,51 @@ impl Speedtest {
     /// Run the test over an established session and return the measured throughput. One-shot: consumes
     /// `self` and drives the whole transfer on a single stream.
     pub async fn run<S: Session>(self, session: &S) -> Result<SpeedReport, ProtocolError> {
+        let (mut writer, mut reader) = session.open_bi().await?;
+        self.over(&mut writer, &mut reader).await
+    }
+
+    /// Drive the test over one stream's two halves, then end the write half on every exit path.
+    ///
+    /// A run that fails (a refusal, an early `Received`, a shortfall, a stray frame, an I/O error)
+    /// still shuts its write half, as a run that succeeds already has, so the responder reads a clean
+    /// end rather than whatever the half's drop gives it. Best effort: the half may be the very thing
+    /// that failed, or already shut, so a shutdown error is logged and the run's own error is the one
+    /// returned. No timer bounds the shutdown: the transport contract is silent on whether one can
+    /// park, and the backends do not (mem shuts its duplex, iroh's finish only queues the end). The
+    /// read half is dropped, never drained: a stream counts until each side has read the
+    /// other's to its end OR dropped both halves (bifrost `Session::open_bi`), and draining an
+    /// unbounded source would need a bound of its own.
+    async fn over<W, R>(self, writer: &mut W, reader: &mut R) -> Result<SpeedReport, ProtocolError>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+    {
         let Self {
             mode,
             limit,
             progress,
         } = self;
-        let (mut writer, mut reader) = session.open_bi().await?;
-
-        // One window: bytes moved and time elapsed are both measured over this exact span.
-        let started = Instant::now();
-        let legs = match mode {
-            Mode::Up => Legs::up(upload(&mut writer, &mut reader, limit, started, progress).await?),
-            Mode::Down => {
-                Legs::down(download(&mut writer, &mut reader, limit, started, progress).await?)
-            }
-            Mode::Bidir => bidir(&mut writer, &mut reader, limit, started, progress).await?,
-        };
-        let elapsed = started.elapsed();
-        Ok(SpeedReport { legs, elapsed })
+        // Boxed: a leg holds a payload chunk buffer across its awaits, and one more unboxed layer
+        // around it overflowed a test thread's stack in a debug build.
+        let measured = Box::pin(async {
+            // One window: bytes moved and time elapsed are both measured over this exact span.
+            let started = Instant::now();
+            let legs = match mode {
+                Mode::Up => Legs::up(upload(writer, reader, limit, started, progress).await?),
+                Mode::Down => Legs::down(download(writer, reader, limit, started, progress).await?),
+                Mode::Bidir => bidir(writer, reader, limit, started, progress).await?,
+            };
+            let elapsed = started.elapsed();
+            Ok(SpeedReport { legs, elapsed })
+        })
+        .await;
+        if measured.is_err()
+            && let Err(error) = writer.shutdown().await
+        {
+            tracing::debug!(%error, "could not end a failed speed run's stream cleanly");
+        }
+        measured
     }
 }
 
@@ -142,6 +170,8 @@ where
     .write(writer)
     .await?;
     let mut reply = std::pin::pin!(Response::read(reader));
+    // `Break` carries a count the sink answered with before the send returned, `Continue` the count
+    // the send moved: the send borrows the write half, so an early answer leaves this scope to shut it.
     let sent = {
         let send = limit.payload(started, progress).send(writer);
         tokio::pin!(send);
@@ -156,17 +186,27 @@ where
                 Response::Unsupported { code, detail } => {
                     return Err(ProtocolError::Refused(Refusal::Method { code, detail }));
                 }
-                // The sink replied before the send returned: a byte-bounded ask it did not fully
-                // take ended early, and a short count cannot stand in for the ask.
-                Response::Received { bytes } => {
-                    return match limit.shortfall(bytes) {
-                        Some(error) => Err(error),
-                        None => Ok(bytes),
-                    };
-                }
+                Response::Received { bytes } => ControlFlow::Break(bytes),
                 _ => return Err(ProtocolError::Mismatched),
             },
-            sent = &mut send => sent?,
+            sent = &mut send => ControlFlow::Continue(sent?),
+        }
+    };
+    let sent = match sent {
+        ControlFlow::Continue(sent) => sent,
+        // The sink replied before the send returned: a byte-bounded ask it did not fully take ended
+        // early, and a short count cannot stand in for the ask.
+        ControlFlow::Break(bytes) => {
+            if let Some(error) = limit.shortfall(bytes) {
+                return Err(error);
+            }
+            // A time-bounded run the sink answered early is still a result, and its stream still
+            // ends cleanly. Best effort: the sink is done with the stream, so a failure here cannot
+            // change the count it confirmed.
+            if let Err(error) = writer.shutdown().await {
+                tracing::debug!(%error, "could not end an early-answered upload's stream cleanly");
+            }
+            return Ok(bytes);
         }
     };
     // The send stopped at the stall bound, not the ask: the peer stopped taking bytes, so the bytes
